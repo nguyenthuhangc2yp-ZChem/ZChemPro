@@ -346,6 +346,8 @@
   let zchemRealtimeApplying = false;
   let zchemRealtimeWriteTimer = null;
   let zchemRealtimeLastJson = '';
+  let zchemRealtimeMainListenerStarted = false;
+  let zchemRealtimeInitPromise = null;
 
   try {
     if(window.firebase && !firebase.apps.length) {
@@ -680,39 +682,57 @@ function zchemInitResultPathListeners(){
 }
 
 async function zchemInitRealtimeDatabaseSync(){
-  if(!zchemRealtimeReady || !zchemDatabase) return;
-  const ref = zchemDatabase.ref(ZCHEM_APPDATA_PATH);
-  try{
-    const snap = await ref.once('value');
-    if(snap.exists()){
-      zchemApplyRealtimeDB(snap.val());
-      zchemRealtimeHydrated = true;
-      if(typeof renderAll === 'function') renderAll();
-    }else{
-      zchemRealtimeHydrated = true;
-      zchemScheduleRealtimeSave(true);
+  if(!zchemRealtimeReady || !zchemDatabase || !zchemAuth) return false;
+  if(!zchemAuth.currentUser) return false;
+  if(zchemRealtimeInitPromise) return zchemRealtimeInitPromise;
+
+  zchemRealtimeInitPromise = (async ()=>{
+    const ref = zchemDatabase.ref(ZCHEM_APPDATA_PATH);
+    try{
+      const snap = await ref.once('value');
+      if(snap.exists()){
+        zchemApplyRealtimeDB(snap.val());
+        zchemRealtimeHydrated = true;
+        if(typeof renderAll === 'function') renderAll();
+      }else{
+        zchemRealtimeHydrated = true;
+        const isAdmin = zchemAuth.currentUser && (zchemAuth.currentUser.uid === ZCHEM_ADMIN_UID || zchemAuth.currentUser.email === ZCHEM_ADMIN_EMAIL);
+        if(isAdmin) zchemScheduleRealtimeSave(true);
+      }
+
+      if(!zchemRealtimeMainListenerStarted){
+        zchemRealtimeMainListenerStarted = true;
+        ref.on('value', snapshot=>{
+          if(!snapshot.exists()) return;
+          const incoming = snapshot.val();
+          const incomingJson = JSON.stringify(incoming || {});
+          if(incomingJson === zchemRealtimeLastJson) return;
+          const ok = zchemApplyRealtimeDB(incoming);
+          if(ok && typeof renderAll === 'function') renderAll();
+        }, error=>{
+          console.error('Không đọc được dữ liệu realtime:', error);
+          zchemRealtimeMainListenerStarted = false;
+          if(typeof showToast === 'function') showToast('Chưa đọc được dữ liệu Realtime Database. Hãy kiểm tra Rules.', 'warn');
+        });
+      }
+      zchemInitResultPathListeners();
+      return true;
+    }catch(error){
+      console.error('Không khởi tạo đồng bộ Realtime Database:', error);
+      if(typeof showToast === 'function') showToast('Chưa khởi tạo được đồng bộ Realtime Database. Hãy đăng nhập lại hoặc kiểm tra Rules.', 'warn');
+      return false;
+    }finally{
+      zchemRealtimeInitPromise = null;
     }
-    ref.on('value', snapshot=>{
-      if(!snapshot.exists()) return;
-      const incoming = snapshot.val();
-      const incomingJson = JSON.stringify(incoming || {});
-      if(incomingJson === zchemRealtimeLastJson) return;
-      const ok = zchemApplyRealtimeDB(incoming);
-      if(ok && typeof renderAll === 'function') renderAll();
-    }, error=>{
-      console.error('Không đọc được dữ liệu realtime:', error);
-      if(typeof showToast === 'function') showToast('Chưa đọc được dữ liệu Realtime Database. Hãy kiểm tra Rules.', 'warn');
-    });
-    zchemInitResultPathListeners();
-  }catch(error){
-    console.error('Không khởi tạo đồng bộ Realtime Database:', error);
-    if(typeof showToast === 'function') showToast('Chưa khởi tạo được đồng bộ Realtime Database. Web vẫn chạy bằng cache trên máy.', 'warn');
-  }
+  })();
+  return zchemRealtimeInitPromise;
 }
+
 
 function saveDB(){
   localStorage.setItem(STORAGE_KEY, JSON.stringify(db));
-  zchemScheduleRealtimeSave();
+  const isAdminUser = zchemAuth && zchemAuth.currentUser && (zchemAuth.currentUser.uid === ZCHEM_ADMIN_UID || zchemAuth.currentUser.email === ZCHEM_ADMIN_EMAIL);
+  if(isAdminUser) zchemScheduleRealtimeSave();
 }
 
   // =========================================================
@@ -1276,6 +1296,7 @@ function saveDB(){
         showToast('Admin vui lòng đăng nhập bằng khu vực Email/Password.', 'warn');
         return;
       }
+      await zchemInitRealtimeDatabaseSync();
       const {localId, matched} = await createOrUpdateLocalStudentFromFirebase(firebaseUser);
       if(matched && localId){
         db.settings.currentUser = localId;
@@ -1298,6 +1319,7 @@ function saveDB(){
     zchemAuth.onAuthStateChanged(async (firebaseUser)=>{
       if(!firebaseUser) return;
       try{
+        await zchemInitRealtimeDatabaseSync();
         if(firebaseUser.uid === ZCHEM_ADMIN_UID || firebaseUser.email === ZCHEM_ADMIN_EMAIL){
           await writeFirebaseUserProfile(firebaseUser, 'admin');
           upsertLocalUser({
@@ -1471,6 +1493,7 @@ function saveDB(){
         fullName:'Nguyễn Hằng - Admin'
       });
       db.settings.currentUser = 'u-admin';
+      await zchemInitRealtimeDatabaseSync();
       saveDB();
       updateSidebar();
       showToast('Đăng nhập admin thành công.', 'success');
