@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ZChem Classroom - Học Hóa cùng cô Hằng | Phiên bản 01</title>
+  <title>ZChem Classroom - Học Hóa cùng cô Hằng | ZChemPro1</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -348,6 +348,9 @@
   let zchemRealtimeLastJson = '';
   let zchemRealtimeMainListenerStarted = false;
   let zchemRealtimeInitPromise = null;
+  const zchemRealtimeListeners = {};
+  let zchemPresenceRef = null;
+  let zchemConnectedRef = null;
 
   try {
     if(window.firebase && !firebase.apps.length) {
@@ -505,20 +508,18 @@ function mergeByIdPreserveExisting(oldList = [], newList = []){
   return Array.from(map.values());
 }
 
-function migrateData(oldData, demoData){
+function migrateData(oldData = {}, demoData = {}){
+  // ZChemPro1: không tự trộn lại dữ liệu DEMO vào dữ liệu thật khi nâng phiên bản.
+  // Nếu admin đã xóa lớp/học sinh demo, bản nâng cấp sẽ giữ nguyên trạng thái đã xóa.
   const migrated = {...oldData};
-  migrated.dataVersion = demoData.dataVersion || 1;
-  migrated.users = mergeByIdPreserveExisting(oldData.users, demoData.users);
-  migrated.classes = mergeByIdPreserveExisting(oldData.classes, demoData.classes);
-  migrated.students = mergeByIdPreserveExisting(oldData.students, demoData.students);
-  migrated.questionBank = mergeByIdPreserveExisting(oldData.questionBank, demoData.questionBank);
-  migrated.monthlyExams = mergeByIdPreserveExisting(oldData.monthlyExams, demoData.monthlyExams);
-  migrated.gradeBanks = mergeByIdPreserveExisting(oldData.gradeBanks, demoData.gradeBanks);
-  migrated.classMembers = oldData.classMembers || demoData.classMembers || {};
-  migrated.studentClasses = oldData.studentClasses || demoData.studentClasses || {};
-  migrated.roster = oldData.roster || demoData.roster || {};
-  migrated.attempts = oldData.attempts || [];
-  migrated.examExitLogs = oldData.examExitLogs || [];
+  migrated.dataVersion = demoData.dataVersion || oldData.dataVersion || 1;
+  const arrayKeys = ['users','classes','students','questionBank','monthlyExams','gradeBanks','attempts','examExitLogs'];
+  arrayKeys.forEach(key => {
+    migrated[key] = Array.isArray(oldData[key]) ? oldData[key] : (Array.isArray(demoData[key]) ? clone(demoData[key]) : []);
+  });
+  migrated.classMembers = oldData.classMembers && typeof oldData.classMembers === 'object' ? oldData.classMembers : {};
+  migrated.studentClasses = oldData.studentClasses && typeof oldData.studentClasses === 'object' ? oldData.studentClasses : {};
+  migrated.roster = oldData.roster && typeof oldData.roster === 'object' ? oldData.roster : {};
   migrated.settings = {
     ...(demoData.settings || {}),
     ...(oldData.settings || {})
@@ -630,6 +631,68 @@ function zchemCloudSafeDB(){
   return copy;
 }
 
+
+function zchemRealtimeListen(path, eventName, callback, errorCallback){
+  if(!zchemRealtimeReady || !zchemDatabase || !path || typeof callback !== 'function') return null;
+  const eventType = eventName || 'value';
+  const key = path + '::' + eventType;
+  zchemStopRealtimeListener(path, eventType);
+  const ref = zchemDatabase.ref(path);
+  ref.on(eventType, callback, errorCallback || (error => console.warn('Realtime listener lỗi tại ' + path + ':', error)));
+  zchemRealtimeListeners[key] = {path, eventType, ref, callback};
+  return ref;
+}
+
+function zchemStopRealtimeListener(path, eventName='value'){
+  const key = path + '::' + eventName;
+  const item = zchemRealtimeListeners[key];
+  if(item){
+    item.ref.off(item.eventType, item.callback);
+    delete zchemRealtimeListeners[key];
+  }
+}
+
+function zchemStopAllRealtimeListeners(){
+  Object.keys(zchemRealtimeListeners).forEach(key=>{
+    const item = zchemRealtimeListeners[key];
+    try{ item.ref.off(item.eventType, item.callback); }catch(error){ console.warn('Không tắt được listener:', error); }
+    delete zchemRealtimeListeners[key];
+  });
+  zchemRealtimeMainListenerStarted = false;
+  zchemInitResultPathListeners.started = false;
+  if(zchemPresenceRef){
+    zchemPresenceRef.set({online:false, lastSeen: firebase.database.ServerValue.TIMESTAMP}).catch(()=>{});
+    try{ zchemPresenceRef.onDisconnect().cancel(); }catch(error){}
+  }
+  if(zchemConnectedRef){
+    try{ zchemConnectedRef.off(); }catch(error){}
+  }
+  zchemPresenceRef = null;
+  zchemConnectedRef = null;
+}
+
+function zchemStartPresence(){
+  if(!zchemRealtimeReady || !zchemDatabase || !zchemAuth?.currentUser) return;
+  const uid = zchemAuth.currentUser.uid;
+  zchemPresenceRef = zchemDatabase.ref('presence/' + uid);
+  zchemConnectedRef = zchemDatabase.ref('.info/connected');
+  zchemConnectedRef.on('value', snap=>{
+    if(snap.val() === true){
+      zchemPresenceRef.set({
+        online:true,
+        email:zchemAuth.currentUser.email || '',
+        role:(zchemAuth.currentUser.uid === ZCHEM_ADMIN_UID || zchemAuth.currentUser.email === ZCHEM_ADMIN_EMAIL) ? 'admin' : 'student',
+        lastSeen: firebase.database.ServerValue.TIMESTAMP
+      }).catch(()=>{});
+      zchemPresenceRef.onDisconnect().set({
+        online:false,
+        email:zchemAuth.currentUser.email || '',
+        lastSeen: firebase.database.ServerValue.TIMESTAMP
+      });
+    }
+  });
+}
+
 function zchemScheduleRealtimeSave(force=false){
   if(!zchemRealtimeReady || !zchemDatabase || zchemRealtimeApplying) return;
   if(!zchemRealtimeHydrated && !force) return;
@@ -640,11 +703,13 @@ function zchemScheduleRealtimeSave(force=false){
       const json = JSON.stringify(payload);
       if(!force && json === zchemRealtimeLastJson) return;
       zchemRealtimeLastJson = json;
-      await zchemDatabase.ref(ZCHEM_APPDATA_PATH).set(payload);
+      // ZChemPro1: dùng update() theo các nhánh con trong appData/current thay vì set() nguyên node.
+      // Các mảng chính vẫn được thay thế nguyên child nên thao tác xóa lớp/học sinh không bị quay lại.
+      await zchemDatabase.ref(ZCHEM_APPDATA_PATH).update(payload);
     }catch(error){
       console.error('Không đồng bộ được dữ liệu chính lên Realtime Database:', error);
     }
-  }, force ? 0 : 450);
+  }, force ? 0 : 650);
 }
 
 function zchemApplyRealtimeDB(cloudData){
@@ -653,10 +718,13 @@ function zchemApplyRealtimeDB(cloudData){
   const normalized = zchemNormalizeDB(cloudData);
   if(currentUser) normalized.settings.currentUser = currentUser;
   zchemRealtimeApplying = true;
-  db = normalized;
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(db));
-  zchemRealtimeLastJson = JSON.stringify(zchemCloudSafeDB());
-  zchemRealtimeApplying = false;
+  try{
+    db = normalized;
+    localStorage.setItem(STORAGE_KEY, JSON.stringify(db));
+    zchemRealtimeLastJson = JSON.stringify(zchemCloudSafeDB());
+  }finally{
+    zchemRealtimeApplying = false;
+  }
   return true;
 }
 
@@ -694,11 +762,14 @@ function zchemInitResultPathListeners(){
   let freeCache = {};
   const apply = ()=>{
     zchemRealtimeApplying = true;
-    zchemMergeCloudAttempts(zchemFlattenCloudResults(resultsCache, freeCache));
-    zchemRealtimeApplying = false;
+    try{
+      zchemMergeCloudAttempts(zchemFlattenCloudResults(resultsCache, freeCache));
+    }finally{
+      zchemRealtimeApplying = false;
+    }
   };
-  zchemDatabase.ref('results').on('value', snap=>{ resultsCache = snap.val() || {}; apply(); }, err=>console.warn('Không đọc được results:', err));
-  zchemDatabase.ref('freePlayResults').on('value', snap=>{ freeCache = snap.val() || {}; apply(); }, err=>console.warn('Không đọc được freePlayResults:', err));
+  zchemRealtimeListen('results', 'value', snap=>{ resultsCache = snap.val() || {}; apply(); }, err=>console.warn('Không đọc được results:', err));
+  zchemRealtimeListen('freePlayResults', 'value', snap=>{ freeCache = snap.val() || {}; apply(); }, err=>console.warn('Không đọc được freePlayResults:', err));
 }
 
 async function zchemInitRealtimeDatabaseSync(){
@@ -716,13 +787,14 @@ async function zchemInitRealtimeDatabaseSync(){
         if(typeof renderAll === 'function') renderAll();
       }else{
         zchemRealtimeHydrated = true;
-        const isAdmin = zchemAuth.currentUser && (zchemAuth.currentUser.uid === ZCHEM_ADMIN_UID || zchemAuth.currentUser.email === ZCHEM_ADMIN_EMAIL);
-        if(isAdmin) zchemScheduleRealtimeSave(true);
+        // ZChemPro1: không tự đẩy DEMO/localStorage lên Firebase khi cloud đang trống.
+        // Admin chỉ ghi lên Firebase sau khi thực hiện thay đổi thật trong giao diện.
+        if(typeof showToast === 'function') showToast('Realtime Database đang trống. Dữ liệu sẽ được ghi khi admin thực hiện thay đổi.', 'warn');
       }
 
       if(!zchemRealtimeMainListenerStarted){
         zchemRealtimeMainListenerStarted = true;
-        ref.on('value', snapshot=>{
+        zchemRealtimeListen(ZCHEM_APPDATA_PATH, 'value', snapshot=>{
           if(!snapshot.exists()) return;
           const incoming = snapshot.val();
           const incomingJson = JSON.stringify(incoming || {});
@@ -735,6 +807,7 @@ async function zchemInitRealtimeDatabaseSync(){
           if(typeof showToast === 'function') showToast('Chưa đọc được dữ liệu Realtime Database. Hãy kiểm tra Rules.', 'warn');
         });
       }
+      zchemStartPresence();
       zchemInitResultPathListeners();
       return true;
     }catch(error){
@@ -753,7 +826,7 @@ function saveDB(){
   db = zchemNormalizeDB(db);
   localStorage.setItem(STORAGE_KEY, JSON.stringify(db));
   const isAdminUser = zchemAuth && zchemAuth.currentUser && (zchemAuth.currentUser.uid === ZCHEM_ADMIN_UID || zchemAuth.currentUser.email === ZCHEM_ADMIN_EMAIL);
-  if(isAdminUser) zchemScheduleRealtimeSave();
+  if(isAdminUser && !zchemRealtimeApplying) zchemScheduleRealtimeSave();
 }
 
   // =========================================================
@@ -1528,6 +1601,8 @@ function saveDB(){
   async function logout(){
     db.settings.currentUser = null;
     saveDB();
+    zchemStopAllRealtimeListeners();
+    zchemRealtimeHydrated = false;
     if(zchemAuth?.currentUser){
       try{ await zchemAuth.signOut(); }catch(error){ console.error('Lỗi đăng xuất Firebase:', error); }
     }
@@ -3550,8 +3625,12 @@ function saveDB(){
     }
     if(zchemRealtimeReady && zchemDatabase){
       zchemDatabase.ref('roster/' + id).remove().catch(console.error);
+      zchemDatabase.ref('classStudents/' + id).remove().catch(console.error);
       zchemDatabase.ref('classMembers/' + id).remove().catch(console.error);
       classStudentUids.forEach(uid=>zchemDatabase.ref('studentClasses/' + uid + '/' + id).remove().catch(console.error));
+      (db.monthlyExams || []).forEach(ex=>{
+        if(ex && ex.id) zchemDatabase.ref('results/' + ex.id + '/' + id).remove().catch(console.error);
+      });
     }
     saveDB(); showToast('Đã xóa lớp và dữ liệu học sinh liên quan.', 'warn'); renderAll();
   }
@@ -3609,26 +3688,42 @@ function saveDB(){
       return;
     }
 
-    const confirmed = confirm(`Bạn có chắc muốn xóa học sinh "${student.name}" khỏi danh sách lớp và xóa toàn bộ kết quả ở chế độ Sân chơi tự do của học sinh này không?`);
+    const confirmed = confirm(`Bạn có chắc muốn xóa học sinh "${student.name}" khỏi danh sách lớp và xóa toàn bộ kết quả liên quan của học sinh này không?`);
     if(!confirmed) return;
 
-    db.attempts = db.attempts.filter(a =>
-      !(
-        a.mode === 'free' &&
-        attemptMatchesStudent(a, student)
-      )
-    );
-
+    db.attempts = db.attempts.filter(a => !attemptMatchesStudent(a, student));
     db.students = db.students.filter(s => s.id !== studentId);
 
-    if(student.email && zchemRealtimeReady && zchemDatabase){
-      const key = emailKey(student.email);
-      zchemDatabase.ref('classStudents/' + student.classId + '/' + key).remove().catch(console.error);
-      zchemDatabase.ref('studentClassIndex/' + key).remove().catch(console.error);
+    if(db.classMembers && student.classId && student.firebaseUid && db.classMembers[student.classId]) delete db.classMembers[student.classId][student.firebaseUid];
+    if(db.studentClasses && student.firebaseUid && db.studentClasses[student.firebaseUid]){
+      delete db.studentClasses[student.firebaseUid][student.classId];
+      if(Object.keys(db.studentClasses[student.firebaseUid]).length === 0) delete db.studentClasses[student.firebaseUid];
+    }
+    if(db.roster && student.classId && db.roster[student.classId]) delete db.roster[student.classId][student.id];
+
+    if(zchemRealtimeReady && zchemDatabase){
+      const key = emailKey(student.email || '');
+      if(key){
+        zchemDatabase.ref('classStudents/' + student.classId + '/' + key).remove().catch(console.error);
+        zchemDatabase.ref('studentClassIndex/' + key).remove().catch(console.error);
+      }
+      if(student.id){
+        zchemDatabase.ref('roster/' + student.classId + '/' + student.id).remove().catch(console.error);
+        zchemDatabase.ref('classStudents/' + student.classId + '/' + student.id).remove().catch(console.error);
+      }
+      if(student.firebaseUid){
+        zchemDatabase.ref('classMembers/' + student.classId + '/' + student.firebaseUid).remove().catch(console.error);
+        zchemDatabase.ref('studentClasses/' + student.firebaseUid + '/' + student.classId).remove().catch(console.error);
+        zchemDatabase.ref('freeStudents/' + student.firebaseUid).remove().catch(console.error);
+        zchemDatabase.ref('freePlayResults/' + student.firebaseUid).remove().catch(console.error);
+        (db.monthlyExams || []).forEach(ex=>{
+          if(ex && ex.id) zchemDatabase.ref('results/' + ex.id + '/' + student.classId + '/' + student.firebaseUid).remove().catch(console.error);
+        });
+      }
     }
 
     saveDB();
-    showToast(`Đã xóa học sinh ${student.name} và toàn bộ kết quả ở chế độ Sân chơi tự do.`, 'warn');
+    showToast(`Đã xóa học sinh ${student.name} và toàn bộ kết quả liên quan.`, 'warn');
     renderAll();
     showScreen('adminScreen');
   }
@@ -4211,7 +4306,8 @@ function saveDB(){
   renderAll();
   zchemInitRealtimeDatabaseSync();
   // Không tự động đăng nhập lại sau khi tải trang.
-  if(zchemAuth){ zchemAuth.signOut().catch(()=>{}); }
+  if(zchemAuth){ zchemStopAllRealtimeListeners(); zchemAuth.signOut().catch(()=>{}); }
+  window.addEventListener('beforeunload', ()=>{ zchemStopAllRealtimeListeners(); });
   applyAudioSettings();
   setTimeout(()=>{ applyAudioSettings(); }, 200);
   </script>
