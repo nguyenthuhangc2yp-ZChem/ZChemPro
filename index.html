@@ -581,25 +581,45 @@ function loadDB(){
     return clone(DEMO);
   }
 }
+function zchemCreateEmptyDB(){
+  return {
+    dataVersion: DEMO.dataVersion || 1,
+    users: [],
+    classes: [{id:'class_free_auto', name:'Lớp tự do', grade:'Tự do', classType:'free', classTypeName:'Tự do', modes:['free']}],
+    students: [],
+    questionBank: [],
+    examExitLogs: [],
+    monthlyExams: [],
+    attempts: [],
+    gradeBanks: [],
+    classMembers: {},
+    studentClasses: {},
+    roster: {},
+    settings: {...(DEMO.settings || {}), currentUser:null}
+  };
+}
+
 function zchemNormalizeDB(data){
-  const base = clone(DEMO);
-  const normalized = migrateData(data || {}, base);
-  if(!Array.isArray(normalized.classes)) normalized.classes = [];
-  normalized.classes = normalized.classes.map(c => { const copy = {...c}; delete copy[['tea','cherId'].join('')]; return copy; });
+  const incoming = (data && typeof data === 'object') ? clone(data) : {};
+  const normalized = {...zchemCreateEmptyDB(), ...incoming};
+  normalized.dataVersion = incoming.dataVersion || DEMO.dataVersion || 1;
+  normalized.settings = {...(DEMO.settings || {}), ...(incoming.settings || {})};
+  if(typeof normalized.settings.currentUser === 'undefined') normalized.settings.currentUser = null;
+  ['users','classes','students','questionBank','monthlyExams','attempts','gradeBanks','examExitLogs'].forEach(key=>{
+    if(!Array.isArray(normalized[key])) normalized[key] = [];
+  });
+  normalized.classes = normalized.classes
+    .filter(c => c && c.id)
+    .map(c => { const copy = {...c}; delete copy[['tea','cherId'].join('')]; return copy; });
   if(!normalized.classes.find(c => c.id === 'class_free_auto')){
     normalized.classes.push({id:'class_free_auto', name:'Lớp tự do', grade:'Tự do', classType:'free', classTypeName:'Tự do', modes:['free']});
   }
-  if(!Array.isArray(normalized.students)) normalized.students = [];
-  normalized.students = normalized.students.map(st=>({birthDate:'', email:'', emailKey:'', rosterStatus:'waiting', ...st}));
-  if(!Array.isArray(normalized.attempts)) normalized.attempts = [];
-  if(!Array.isArray(normalized.questions)) normalized.questions = [];
-  if(!Array.isArray(normalized.monthlyExams)) normalized.monthlyExams = [];
-  if(!Array.isArray(normalized.gradeBanks)) normalized.gradeBanks = [];
-  if(!Array.isArray(normalized.examExitLogs)) normalized.examExitLogs = [];
-  if(!normalized.classMembers || typeof normalized.classMembers !== 'object') normalized.classMembers = {};
-  if(!normalized.studentClasses || typeof normalized.studentClasses !== 'object') normalized.studentClasses = {};
-  if(!normalized.roster || typeof normalized.roster !== 'object') normalized.roster = {};
-  if(!normalized.settings || typeof normalized.settings !== 'object') normalized.settings = {};
+  normalized.students = normalized.students
+    .filter(st => st && st.id)
+    .map(st=>({birthDate:'', email:'', emailKey:'', rosterStatus:'waiting', ...st}));
+  ['classMembers','studentClasses','roster'].forEach(key=>{
+    if(!normalized[key] || typeof normalized[key] !== 'object' || Array.isArray(normalized[key])) normalized[key] = {};
+  });
   return normalized;
 }
 
@@ -730,6 +750,7 @@ async function zchemInitRealtimeDatabaseSync(){
 
 
 function saveDB(){
+  db = zchemNormalizeDB(db);
   localStorage.setItem(STORAGE_KEY, JSON.stringify(db));
   const isAdminUser = zchemAuth && zchemAuth.currentUser && (zchemAuth.currentUser.uid === ZCHEM_ADMIN_UID || zchemAuth.currentUser.email === ZCHEM_ADMIN_EMAIL);
   if(isAdminUser) zchemScheduleRealtimeSave();
@@ -3501,9 +3522,38 @@ function saveDB(){
     saveDB(); showToast('Đã thêm lớp mới.', 'success'); renderAll();
   }
   function deleteClass(id){
-    if(!confirm('Xóa lớp này?')) return;
+    if(id === getFreeClassId() || id === 'class_free_auto'){
+      showToast('Không thể xóa Lớp tự do vì đây là lớp hệ thống.', 'warn');
+      return;
+    }
+    const classObj = cls(id);
+    if(!classObj){ showToast('Không tìm thấy lớp cần xóa.', 'error'); return; }
+    const classStudentIds = new Set(db.students.filter(s=>s.classId===id).map(s=>s.id));
+    const classStudentUids = new Set(db.students.filter(s=>s.classId===id && s.firebaseUid).map(s=>s.firebaseUid));
+    const confirmText = `Xóa lớp "${classObj.name}" và ${classStudentIds.size} học sinh thuộc lớp này khỏi dữ liệu ứng dụng?`;
+    if(!confirm(confirmText)) return;
     db.classes = db.classes.filter(c=>c.id!==id);
-    saveDB(); showToast('Đã xóa lớp.', 'warn'); renderAll();
+    db.students = db.students.filter(s=>s.classId!==id);
+    db.attempts = db.attempts.filter(a=>a.classId!==id);
+    db.monthlyExams = db.monthlyExams.filter(ex=>ex.classId!==id);
+    db.questionBank = db.questionBank.map(q=>({
+      ...q,
+      classIds: Array.isArray(q.classIds) ? q.classIds.filter(classId=>classId!==id) : q.classIds
+    }));
+    if(db.classMembers && db.classMembers[id]) delete db.classMembers[id];
+    if(db.roster && db.roster[id]) delete db.roster[id];
+    if(db.studentClasses){
+      Object.keys(db.studentClasses).forEach(uid=>{
+        if(db.studentClasses[uid] && db.studentClasses[uid][id]) delete db.studentClasses[uid][id];
+        if(db.studentClasses[uid] && Object.keys(db.studentClasses[uid]).length === 0) delete db.studentClasses[uid];
+      });
+    }
+    if(zchemRealtimeReady && zchemDatabase){
+      zchemDatabase.ref('roster/' + id).remove().catch(console.error);
+      zchemDatabase.ref('classMembers/' + id).remove().catch(console.error);
+      classStudentUids.forEach(uid=>zchemDatabase.ref('studentClasses/' + uid + '/' + id).remove().catch(console.error));
+    }
+    saveDB(); showToast('Đã xóa lớp và dữ liệu học sinh liên quan.', 'warn'); renderAll();
   }
   function viewClassDetail(id){
     const c = cls(id);
