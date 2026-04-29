@@ -1000,12 +1000,72 @@ function zchemFlattenCloudResults(resultsRoot, freeRoot){
   return out.filter(a=>a && (a.id || a.submittedAt));
 }
 
+
+function zchemBuildLeaderboardPublicAttempt(attempt, firebaseUser, roster){
+  const correctCount = asArray(attempt.details).filter(d => d && d.correct).length;
+  const questionCount = asArray(attempt.details).length;
+  return zchemSanitizeResultForFirebase({
+    id: attempt.id || '',
+    studentName: attempt.studentName || currentUser()?.fullName || firebaseUser?.displayName || 'Học sinh',
+    classId: attempt.classId || getFreeClassId(),
+    className: cls(attempt.classId)?.name || '',
+    grade: attempt.grade || cls(attempt.classId)?.grade || '',
+    mode: attempt.mode || 'free',
+    examId: attempt.examId || '',
+    examTitle: attempt.examTitle || '',
+    format: attempt.format || 'individual',
+    score: Number(attempt.score || 0),
+    total: Number(attempt.total || 0),
+    correctCount,
+    questionCount,
+    submittedAt: attempt.submittedAt || nowISO(),
+    durationSec: Number(attempt.durationSec || 0),
+    firebaseUid: firebaseUser?.uid || attempt.firebaseUid || '',
+    rosterStudentId: roster?.id || attempt.rosterStudentId || '',
+    rosterMatched: !!roster,
+    savedAt: firebase.database.ServerValue.TIMESTAMP
+  });
+}
+
+function zchemFlattenLeaderboards(leaderboardsRoot){
+  const out = [];
+  const root = leaderboardsRoot || {};
+  const pushItem = (item, defaults={})=>{
+    if(item && typeof item === 'object' && (item.id || item.submittedAt || item.score !== undefined)){
+      out.push({...defaults, ...item, fromFirebase:true, fromLeaderboard:true});
+    }
+  };
+  Object.entries(root.free || {}).forEach(([classId, classNode])=>{
+    Object.entries(classNode || {}).forEach(([studentUid, attemptsNode])=>{
+      if(attemptsNode && typeof attemptsNode === 'object'){
+        if(attemptsNode.score !== undefined || attemptsNode.submittedAt) pushItem(attemptsNode, {mode:'free', classId, firebaseUid:studentUid});
+        else Object.values(attemptsNode || {}).forEach(item=>pushItem(item, {mode:'free', classId, firebaseUid:studentUid}));
+      }
+    });
+  });
+  Object.entries(root.exams || {}).forEach(([examId, examNode])=>{
+    Object.entries(examNode || {}).forEach(([classId, classNode])=>{
+      Object.entries(classNode || {}).forEach(([studentUid, item])=>{
+        pushItem(item, {mode:'exam', examId, classId, firebaseUid:studentUid});
+      });
+    });
+  });
+  return out.filter(a=>a && (a.id || a.submittedAt));
+}
+
+function zchemMergeLeaderboardAttempts(leaderboardsRoot){
+  zchemMergeCloudAttempts(zchemFlattenLeaderboards(leaderboardsRoot));
+}
+
 function zchemMergeCloudAttempts(cloudAttempts){
   if(!Array.isArray(cloudAttempts)) return;
   const keyOf = a => String(a.id || [a.examId, a.classId, a.firebaseUid || a.studentName, a.submittedAt].join('@@'));
+  const localAttempts = db.attempts || [];
+  const localByKey = new Map(localAttempts.map(a => [keyOf(a), a]));
   const cloudKeys = new Set(cloudAttempts.map(keyOf));
-  const localOnly = (db.attempts || []).filter(a => !cloudKeys.has(keyOf(a)));
-  db.attempts = [...localOnly, ...cloudAttempts].map(normalizeAttemptItem);
+  const localOnly = localAttempts.filter(a => !cloudKeys.has(keyOf(a)));
+  const mergedCloud = cloudAttempts.map(cloud => ({...(localByKey.get(keyOf(cloud)) || {}), ...cloud}));
+  db.attempts = [...localOnly, ...mergedCloud].map(normalizeAttemptItem);
   db = zchemNormalizeDB(db);
   zchemPersistLocalDB();
   if(typeof renderAll === 'function') renderAll();
@@ -1170,16 +1230,19 @@ function zchemInitResultPathListeners(isAdmin=false){
   if(isAdmin){
     zchemRealtimeListen('results', 'value', snap=>{ resultsCache = snap.val() || {}; apply(); }, err=>console.warn('Không đọc được results:', err));
     zchemRealtimeListen('freePlayResults', 'value', snap=>{ freeCache = snap.val() || {}; apply(); }, err=>console.warn('Không đọc được freePlayResults:', err));
+    zchemRealtimeListen('leaderboards', 'value', snap=>{ zchemMergeLeaderboardAttempts(snap.val() || {}); }, err=>console.warn('Không đọc được leaderboards:', err));
     return;
   }
 
-  // Học sinh không nghe toàn bộ results/freePlayResults; chỉ nghe lịch sử của chính tài khoản hiện tại.
+  // Học sinh chỉ nghe lịch sử chi tiết của chính mình, nhưng nghe bảng xếp hạng rút gọn của toàn hệ thống.
   zchemRealtimeListen('freePlayResults/' + uid, 'value', snap=>{
     freeCache = uid ? {[uid]: (snap.val() || {})} : {};
     apply();
   }, err=>console.warn('Không đọc được freePlayResults của học sinh:', err));
 
-  // Kết quả thi theo exam/class được ghi khi nộp bài. Học sinh không cần nghe toàn bộ bảng điểm của lớp.
+  zchemRealtimeListen('leaderboards', 'value', snap=>{
+    zchemMergeLeaderboardAttempts(snap.val() || {});
+  }, err=>console.warn('Không đọc được bảng xếp hạng realtime của học sinh:', err));
 }
 
 
@@ -2182,13 +2245,19 @@ function saveDB(){
     });
     try{
       try{ await firebaseUser.getIdToken(true); }catch(tokenError){ console.warn('Không refresh được Firebase ID token:', tokenError); }
+      const leaderboardData = zchemBuildLeaderboardPublicAttempt(attempt, firebaseUser, roster);
+      const updates = {};
       if(attempt.mode === 'exam'){
         const examId = zchemFirebasePathKey(attempt.examId || 'exam_default');
         const resultClassId = zchemFirebasePathKey(attempt.classId || 'class_unknown');
-        await zchemDatabase.ref('results/' + examId + '/' + resultClassId + '/' + firebaseUser.uid).update(baseData);
+        updates['results/' + examId + '/' + resultClassId + '/' + firebaseUser.uid] = baseData;
+        updates['leaderboards/exams/' + examId + '/' + resultClassId + '/' + firebaseUser.uid] = leaderboardData;
       }else{
-        await zchemDatabase.ref('freePlayResults/' + firebaseUser.uid + '/' + attemptId).set(baseData);
+        const freeClassId = zchemFirebasePathKey(attempt.classId || getFreeClassId());
+        updates['freePlayResults/' + firebaseUser.uid + '/' + attemptId] = baseData;
+        updates['leaderboards/free/' + freeClassId + '/' + firebaseUser.uid + '/' + attemptId] = leaderboardData;
       }
+      await zchemDatabase.ref().update(updates);
       attempt.firebaseUid = firebaseUser.uid;
       attempt.firebaseEmail = firebaseUser.email || '';
       attempt.studentEmail = attempt.studentEmail || firebaseUser.email || '';
