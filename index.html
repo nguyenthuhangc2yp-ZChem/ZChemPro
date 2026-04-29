@@ -861,6 +861,7 @@ function zchemStopAllRealtimeListeners(){
     delete zchemRealtimeListeners[key];
   });
   zchemRealtimeMainListenerStarted = false;
+  zchemRealtimeInitPromise = null;
   zchemInitResultPathListeners.started = false;
   if(zchemPresenceRef){
     zchemPresenceRef.set({online:false, lastSeen: firebase.database.ServerValue.TIMESTAMP}).catch(()=>{});
@@ -1331,13 +1332,50 @@ function saveDB(){
     }
     return null;
   };
+
+  function isAdminUser(){
+    const u = currentUser();
+    return !!(u && u.role === 'admin' && zchemCurrentAuthIsAdmin());
+  }
+
+  function isStudentUser(){
+    const u = currentUser();
+    return !!(u && u.role === 'student');
+  }
+
+  function hasSignedInStudent(){
+    const u = currentUser();
+    return !!(u && u.role === 'student' && zchemAuth && zchemAuth.currentUser && u.firebaseUid === zchemAuth.currentUser.uid);
+  }
+
+  function showAccessDenied(title='Khu vực bị giới hạn', message='Mục này chỉ dành cho tài khoản admin.') {
+    return `
+      <div class="lock-screen">
+        <div class="card center">
+          <h2>${esc(title)}</h2>
+          <p class="muted">${esc(message)}</p>
+          <div class="pill-row" style="justify-content:center;margin-top:14px">
+            <button class="btn" onclick="showScreen('homeScreen')">Về trang chủ</button>
+            <button class="btn ghost" onclick="showScreen('loginScreen')">Đăng nhập admin</button>
+          </div>
+        </div>
+      </div>
+    `;
+  }
+
   const averagePercent = (items)=> items.length ? Math.round(items.reduce((s,a)=>s + (a.score/a.total)*100,0)/items.length) : 0;
   const groupBy = (arr, keyFn)=> arr.reduce((acc,item)=>{ const k=keyFn(item); (acc[k]=acc[k]||[]).push(item); return acc; }, {});
   function getAllowedClasses(){
     const u = currentUser();
-    if(!u) return db.classes;
+    if(!u) return db.classes.filter(c => c && c.id === getFreeClassId());
     if(u.role==='admin') return db.classes;
-    return db.classes;
+    if(u.role==='student') {
+      const ids = new Set(getCurrentStudentClassIds());
+      if(!ids.size && u.classId) ids.add(u.classId);
+      if(!ids.size) ids.add(getFreeClassId());
+      return db.classes.filter(c => ids.has(c.id));
+    }
+    return [];
   }
   function typeLabel(type){
     return {
@@ -1854,7 +1892,12 @@ function saveDB(){
   }
 
   async function saveAttemptToFirebase(attempt){
-    if(!attempt || !zchemRealtimeReady || !zchemDatabase || !zchemAuth?.currentUser) return;
+    if(!attempt) return false;
+    if(!zchemRealtimeReady || !zchemDatabase || !zchemAuth || !zchemAuth.currentUser){
+      console.warn('Chưa có phiên Firebase Auth nên bài làm chỉ lưu trên thiết bị này.', attempt);
+      showToast('Bài làm đã lưu trên máy. Để đồng bộ lên Firebase, học sinh cần đăng nhập Google trước khi làm bài.', 'warn');
+      return false;
+    }
     const firebaseUser = zchemAuth.currentUser;
     const roster = getStudentRosterMatches(firebaseUser.uid).find(st => st.classId === attempt.classId) || findRosterStudentByEmail(firebaseUser.email || '');
     const baseData = {
@@ -1870,15 +1913,25 @@ function saveDB(){
     };
     try{
       if(attempt.mode === 'exam'){
-        const examId = attempt.examId || 'exam_default';
-        const resultClassId = attempt.classId || 'class_unknown';
+        const examId = zchemFirebasePathKey(attempt.examId || 'exam_default');
+        const resultClassId = zchemFirebasePathKey(attempt.classId || 'class_unknown');
         await zchemDatabase.ref('results/' + examId + '/' + resultClassId + '/' + firebaseUser.uid).set(baseData);
       }else{
-        await zchemDatabase.ref('freePlayResults/' + firebaseUser.uid + '/' + attempt.id).set(baseData);
+        await zchemDatabase.ref('freePlayResults/' + firebaseUser.uid + '/' + zchemFirebasePathKey(attempt.id || uid('att_'))).set(baseData);
       }
+      attempt.firebaseUid = firebaseUser.uid;
+      attempt.firebaseEmail = firebaseUser.email || '';
+      attempt.firebaseSyncStatus = 'synced';
+      attempt.firebaseSyncedAt = nowISO();
+      zchemPersistLocalDB();
+      return true;
     }catch(error){
       console.error('Không thể ghi kết quả lên Realtime Database:', error);
+      attempt.firebaseSyncStatus = 'failed';
+      attempt.firebaseSyncError = error && error.message ? error.message : String(error);
+      zchemPersistLocalDB();
       showToast('Đã lưu trên máy. Chưa ghi được lên Realtime Database, hãy kiểm tra databaseURL và Rules.', 'warn');
+      return false;
     }
   }
 
@@ -2142,10 +2195,27 @@ function saveDB(){
   // =========================================================
   // Routing / Screen Render
   // =========================================================
+  function syncNavVisibility(){
+    const admin = isAdminUser();
+    document.querySelectorAll('#sideNav button').forEach(btn=>{
+      const target = btn.dataset.screen;
+      if(target === 'reportsScreen' || target === 'adminScreen'){
+        btn.classList.toggle('hidden', !admin);
+      }else{
+        btn.classList.remove('hidden');
+      }
+    });
+  }
+
   function setActiveNav(screen){
+    syncNavVisibility();
     document.querySelectorAll('#sideNav button').forEach(btn=> btn.classList.toggle('active', btn.dataset.screen===screen));
   }
   function showScreen(screen){
+    if((screen === 'reportsScreen' || screen === 'adminScreen') && !isAdminUser()){
+      screen = 'loginScreen';
+      showToast('Mục Báo cáo/Thống kê và Admin chỉ dành cho tài khoản admin.', 'warn');
+    }
     state.screen = screen;
     document.querySelectorAll('.screen').forEach(s=>s.classList.remove('active'));
     $(screen).classList.add('active');
@@ -2163,6 +2233,7 @@ function saveDB(){
     const u = currentUser();
     $('sideUser').textContent = u ? u.fullName : 'Khách';
     $('sideRole').textContent = u ? roleLabel(u.role) : 'Chưa đăng nhập';
+    syncNavVisibility();
   }
 
   // =========================================================
@@ -2747,8 +2818,13 @@ function saveDB(){
   }
   function beginFree(e){
     e.preventDefault();
-    const roster = getCurrentRosterStudent();
     const u = currentUser();
+    if(!u || u.role !== 'student' || !zchemAuth?.currentUser){
+      showToast('Học sinh cần đăng nhập Google trước khi làm bài để kết quả tự đồng bộ lên Firebase.', 'warn');
+      showScreen('loginScreen');
+      return;
+    }
+    const roster = getCurrentRosterStudent();
     let name = $('freeName').value.trim();
     let classId = $('freeClass').value;
     const format = $('freeFormat').value;
@@ -2769,6 +2845,11 @@ function saveDB(){
   function beginExam(e){
     e.preventDefault();
     const u = currentUser();
+    if(!u || u.role !== 'student' || !zchemAuth?.currentUser){
+      showToast('Học sinh cần đăng nhập Google trước khi vào thi để bài làm tự lưu vào Firebase.', 'warn');
+      showScreen('loginScreen');
+      return;
+    }
     let name = $('examName').value.trim();
     const choice = $('examSession').value;
     const parsedChoice = parseExamChoice(choice);
@@ -3263,7 +3344,7 @@ function saveDB(){
     state.quiz = null; state.questionIndex=0; state.answers={}; state.confirmedAnswers={}; state.feedback=null;
     showScreen('homeScreen');
   }
-  function submitQuiz(){
+  async function submitQuiz(){
     if(examLocked) return;
     if(!state.quiz) return;
     saveCurrentResponseSilently();
@@ -3293,9 +3374,10 @@ function saveDB(){
       score, total, submittedAt: nowISO(), durationSec,
       details
     };
+    attempt.firebaseSyncStatus = 'pending';
     db.attempts.push(attempt);
     saveDB();
-    saveAttemptToFirebase(attempt);
+    await saveAttemptToFirebase(attempt);
 
     // reset quiz before showing result so leaderboard can refresh
     state.quiz = null; state.questionIndex=0; state.answers={}; state.confirmedAnswers={}; state.feedback=null;
@@ -3670,6 +3752,10 @@ function saveDB(){
   // Reports
   // =========================================================
   function renderReports(){
+    if(!isAdminUser()){
+      $('reportsScreen').innerHTML = showAccessDenied('Báo cáo bị giới hạn', 'Học sinh không được xem mục Báo cáo và Thống kê. Khu vực này chỉ dành cho admin.');
+      return;
+    }
     const allowedClasses = getAllowedClasses();
     const allowedIds = allowedClasses.map(c=>c.id);
     const attempts = db.attempts.filter(a=>allowedIds.includes(a.classId));
@@ -4587,7 +4673,7 @@ function saveDB(){
         <button class="btn ghost" onclick="closeModal();showScreen('freePlayScreen')">🎮 Sân chơi tự do</button>
         <button class="btn ghost" onclick="closeModal();showScreen('examEntryScreen')">📝 Vào thi</button>
         <button class="btn ghost" onclick="closeModal();showScreen('leaderboardScreen')">🏆 Bảng xếp hạng</button>
-        <button class="btn ghost" onclick="closeModal();showScreen('reportsScreen')">📊 Báo cáo</button>
+        ${isAdminUser() ? `<button class="btn ghost" onclick="closeModal();showScreen('reportsScreen')">📊 Báo cáo</button><button class="btn ghost" onclick="closeModal();showScreen('adminScreen')">🧩 Admin</button>` : ''}
         <button class="btn ghost" onclick="closeModal();showScreen('loginScreen')">🔐 Đăng nhập</button>
       </div>
     `);
@@ -4599,8 +4685,10 @@ function saveDB(){
   document.querySelectorAll('#sideNav button').forEach(btn=>{
     btn.addEventListener('click', ()=>{
       const target = btn.dataset.screen;
-      const u = currentUser();
-      if(target==='adminScreen' && (!u || u.role!=='admin')) return showScreen('loginScreen');
+      if((target==='adminScreen' || target==='reportsScreen') && !isAdminUser()){
+        showToast('Mục này chỉ dành cho tài khoản admin.', 'warn');
+        return showScreen('loginScreen');
+      }
       showScreen(target);
     });
   });
