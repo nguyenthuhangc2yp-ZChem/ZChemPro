@@ -1040,6 +1040,59 @@ function zchemInitResultPathListeners(isAdmin=false){
   // Kết quả thi theo exam/class được ghi khi nộp bài. Học sinh không cần nghe toàn bộ bảng điểm của lớp.
 }
 
+
+function zchemBuildStudentFromFirebaseProfile(firebaseUser, profile){
+  if(!firebaseUser || !profile || typeof profile !== 'object') return null;
+  const classIds = Array.from(new Set([
+    ...asArray(profile.classIds),
+    ...Object.keys(profile.classes || {}),
+    profile.classId || ''
+  ].filter(Boolean)));
+  const primaryClassId = profile.classId || classIds[0] || getFreeClassId();
+  const status = profile.rosterStatus || (primaryClassId === getFreeClassId() ? 'free' : 'matched');
+  return {
+    id: profile.rosterStudentId || (status === 'free' ? 'free_' + firebaseUser.uid : 'profile_' + firebaseUser.uid + '_' + primaryClassId),
+    name: profile.displayName || firebaseUser.displayName || 'Học sinh',
+    birthDate: normalizeBirthDate(profile.birthDate || ''),
+    email: normalizeEmail(firebaseUser.email || profile.email || ''),
+    emailKey: emailKey(firebaseUser.email || profile.email || ''),
+    classId: primaryClassId,
+    grade: profile.grade || cls(primaryClassId)?.grade || '',
+    firebaseUid: firebaseUser.uid,
+    rosterStatus: status,
+    linkedAt: profile.linkedAt || nowISO()
+  };
+}
+
+async function zchemReadExistingStudentProfile(firebaseUser){
+  if(!firebaseUser || !zchemDatabase) return null;
+  try{
+    const snap = await zchemDatabase.ref('users/' + firebaseUser.uid).once('value');
+    const profile = snap.val();
+    if(profile && typeof profile === 'object' && profile.role === 'student') return profile;
+  }catch(error){
+    console.warn('Không đọc được hồ sơ học sinh đã đăng kí:', error);
+  }
+  return null;
+}
+
+function zchemUpsertProfileStudentLocal(firebaseUser, profile){
+  const student = zchemBuildStudentFromFirebaseProfile(firebaseUser, profile);
+  if(!student || !student.classId) return null;
+  const idx = db.students.findIndex(s =>
+    (s && student.id && s.id === student.id) ||
+    (s && s.firebaseUid === firebaseUser.uid && s.classId === student.classId) ||
+    (s && normalizeEmail(s.email || '') && normalizeEmail(s.email || '') === normalizeEmail(student.email || '') && s.classId === student.classId)
+  );
+  if(idx >= 0){
+    db.students[idx] = {...db.students[idx], ...student};
+  }else{
+    db.students.push(student);
+  }
+  ensureLocalMembership(student);
+  return student;
+}
+
 async function zchemLoadStudentMembershipData(firebaseUser){
   if(!firebaseUser || !zchemRealtimeReady || !zchemDatabase) return;
   const uid = firebaseUser.uid;
@@ -1053,6 +1106,13 @@ async function zchemLoadStudentMembershipData(firebaseUser){
     if(userData.classId) classIds.add(userData.classId);
     Object.keys(userData.classes || {}).forEach(id=>classIds.add(id));
     asArray(userData.classIds).forEach(id=>classIds.add(id));
+    if(userData.role === 'student'){
+      const profileStudent = zchemBuildStudentFromFirebaseProfile(firebaseUser, userData);
+      if(profileStudent){
+        studentsToMerge.push(profileStudent);
+        if(profileStudent.classId) classIds.add(profileStudent.classId);
+      }
+    }
   }catch(error){ console.warn('Không đọc được hồ sơ user:', error); }
 
   try{
@@ -1751,7 +1811,7 @@ function saveDB(){
   async function createOrUpdateLocalStudentFromFirebase(firebaseUser){
     let matches = getStudentRosterMatches(firebaseUser.uid);
     if(!matches.length) matches = findRosterStudentsByEmail(firebaseUser.email || '');
-    if(!matches.length) return {localId:null, matched:null, matches:[]};
+    if(!matches.length) return await createOrUpdateLocalStudentFromExistingProfile(firebaseUser);
     matches.forEach(matched => {
       matched.firebaseUid = firebaseUser.uid;
       matched.email = normalizeEmail(firebaseUser.email || matched.email || '');
@@ -1778,6 +1838,21 @@ function saveDB(){
     }
     const localId = await createLocalStudentUser(firebaseUser, primary, 'matched', matches);
     return {localId, matched:primary, matches};
+  }
+
+  async function createOrUpdateLocalStudentFromExistingProfile(firebaseUser){
+    const profile = await zchemReadExistingStudentProfile(firebaseUser);
+    if(!profile) return {localId:null, matched:null, matches:[]};
+    const profileStudent = zchemUpsertProfileStudentLocal(firebaseUser, profile);
+    if(!profileStudent) return {localId:null, matched:null, matches:[]};
+    const classIds = Array.from(new Set([
+      ...asArray(profile.classIds),
+      ...Object.keys(profile.classes || {}),
+      profileStudent.classId
+    ].filter(Boolean)));
+    const profileMatches = classIds.map(classId => ({...profileStudent, classId, grade: profile.grade || cls(classId)?.grade || profileStudent.grade || ''}));
+    const localId = await createLocalStudentUser(firebaseUser, profileStudent, profileStudent.rosterStatus || profile.rosterStatus || 'matched', profileMatches.length ? profileMatches : [profileStudent]);
+    return {localId, matched:profileStudent, matches:profileMatches.length ? profileMatches : [profileStudent]};
   }
 
   function openStudentRegistrationModal(firebaseUser){
@@ -1891,16 +1966,67 @@ function saveDB(){
     showScreen('freePlayScreen');
   }
 
-  async function saveAttemptToFirebase(attempt){
+  function zchemSanitizeResultForFirebase(value, depth=0){
+    if(depth > 18) return null;
+    if(value === undefined || typeof value === 'function' || typeof value === 'symbol') return null;
+    if(value === null || typeof value === 'string' || typeof value === 'number' || typeof value === 'boolean') return value;
+    if(typeof File !== 'undefined' && value instanceof File){
+      return {
+        name: value.name || '',
+        type: value.type || '',
+        size: value.size || 0,
+        lastModified: value.lastModified || 0,
+        storedAs: 'file-metadata-only'
+      };
+    }
+    if(typeof Blob !== 'undefined' && value instanceof Blob){
+      return {type: value.type || '', size: value.size || 0, storedAs: 'blob-metadata-only'};
+    }
+    if(value instanceof Date) return value.toISOString();
+    if(Array.isArray(value)) return value.map(item => zchemSanitizeResultForFirebase(item, depth + 1)).filter(item => item !== undefined);
+    if(typeof value === 'object'){
+      const out = {};
+      Object.entries(value).forEach(([key, item])=>{
+        if(!key) return;
+        const safe = zchemSanitizeResultForFirebase(item, depth + 1);
+        if(safe !== undefined) out[key] = safe;
+      });
+      return out;
+    }
+    return String(value);
+  }
+
+  function zchemResultBelongsToCurrentStudent(attempt, firebaseUser){
+    if(!attempt || !firebaseUser) return false;
+    if(attempt.firebaseUid && attempt.firebaseUid === firebaseUser.uid) return true;
+    const attemptEmail = normalizeEmail(attempt.studentEmail || attempt.firebaseEmail || '');
+    const userEmail = normalizeEmail(firebaseUser.email || '');
+    if(attemptEmail && userEmail && attemptEmail === userEmail) return true;
+    const u = currentUser();
+    if(u && u.role === 'student') {
+      const userName = normalizeVietnameseName(u.fullName || u.username || '');
+      const attemptName = normalizeVietnameseName(attempt.studentName || '');
+      if(userName && attemptName && userName === attemptName) return true;
+    }
+    return false;
+  }
+
+  async function saveAttemptToFirebase(attempt, options={}){
     if(!attempt) return false;
-    if(!zchemRealtimeReady || !zchemDatabase || !zchemAuth || !zchemAuth.currentUser){
+    if(!zchemFirebaseReady || !zchemRealtimeReady || !zchemDatabase || !zchemAuth || !zchemAuth.currentUser){
       console.warn('Chưa có phiên Firebase Auth nên bài làm chỉ lưu trên thiết bị này.', attempt);
-      showToast('Bài làm đã lưu trên máy. Để đồng bộ lên Firebase, học sinh cần đăng nhập Google trước khi làm bài.', 'warn');
+      if(!options.silent) showToast('Bài làm đã lưu trên máy. Để đồng bộ lên Firebase, học sinh cần đăng nhập Google trước khi làm bài.', 'warn');
       return false;
     }
     const firebaseUser = zchemAuth.currentUser;
+    if(!zchemCurrentAuthIsAdmin() && !zchemResultBelongsToCurrentStudent(attempt, firebaseUser)){
+      const userEmail = normalizeEmail(firebaseUser.email || '');
+      if(userEmail && !attempt.studentEmail) attempt.studentEmail = userEmail;
+    }
     const roster = getStudentRosterMatches(firebaseUser.uid).find(st => st.classId === attempt.classId) || findRosterStudentByEmail(firebaseUser.email || '');
-    const baseData = {
+    const attemptId = zchemFirebasePathKey(attempt.id || uid('att_'));
+    attempt.id = attempt.id || attemptId;
+    const baseData = zchemSanitizeResultForFirebase({
       ...attempt,
       firebaseUid: firebaseUser.uid,
       firebaseEmail: firebaseUser.email || '',
@@ -1910,18 +2036,21 @@ function saveDB(){
       rosterMatched: !!roster,
       className: cls(attempt.classId)?.name || '',
       savedAt: firebase.database.ServerValue.TIMESTAMP
-    };
+    });
     try{
+      try{ await firebaseUser.getIdToken(true); }catch(tokenError){ console.warn('Không refresh được Firebase ID token:', tokenError); }
       if(attempt.mode === 'exam'){
         const examId = zchemFirebasePathKey(attempt.examId || 'exam_default');
         const resultClassId = zchemFirebasePathKey(attempt.classId || 'class_unknown');
-        await zchemDatabase.ref('results/' + examId + '/' + resultClassId + '/' + firebaseUser.uid).set(baseData);
+        await zchemDatabase.ref('results/' + examId + '/' + resultClassId + '/' + firebaseUser.uid).update(baseData);
       }else{
-        await zchemDatabase.ref('freePlayResults/' + firebaseUser.uid + '/' + zchemFirebasePathKey(attempt.id || uid('att_'))).set(baseData);
+        await zchemDatabase.ref('freePlayResults/' + firebaseUser.uid + '/' + attemptId).set(baseData);
       }
       attempt.firebaseUid = firebaseUser.uid;
       attempt.firebaseEmail = firebaseUser.email || '';
+      attempt.studentEmail = attempt.studentEmail || firebaseUser.email || '';
       attempt.firebaseSyncStatus = 'synced';
+      attempt.firebaseSyncError = '';
       attempt.firebaseSyncedAt = nowISO();
       zchemPersistLocalDB();
       return true;
@@ -1930,8 +2059,25 @@ function saveDB(){
       attempt.firebaseSyncStatus = 'failed';
       attempt.firebaseSyncError = error && error.message ? error.message : String(error);
       zchemPersistLocalDB();
-      showToast('Đã lưu trên máy. Chưa ghi được lên Realtime Database, hãy kiểm tra databaseURL và Rules.', 'warn');
+      if(!options.silent) showToast('Đã lưu trên máy. Chưa ghi được lên Realtime Database, hãy kiểm tra databaseURL và Rules.', 'warn');
       return false;
+    }
+  }
+
+  async function zchemSyncPendingStudentAttempts(options={}){
+    if(!zchemRealtimeReady || !zchemDatabase || !zchemAuth?.currentUser) return;
+    const firebaseUser = zchemAuth.currentUser;
+    const pending = (db.attempts || []).filter(a => a && a.firebaseSyncStatus !== 'synced' && zchemResultBelongsToCurrentStudent(a, firebaseUser));
+    if(!pending.length) return;
+    let okCount = 0;
+    for(const attempt of pending){
+      const ok = await saveAttemptToFirebase(attempt, {silent:true});
+      if(ok) okCount++;
+    }
+    zchemPersistLocalDB();
+    if(okCount && !options.silent){
+      showToast('Đã đồng bộ bổ sung ' + okCount + ' bài làm đang chờ lên Firebase.', 'success');
+      renderAll();
     }
   }
 
@@ -1958,6 +2104,7 @@ function saveDB(){
         saveDB();
         updateSidebar();
         renderAll();
+        zchemSyncPendingStudentAttempts({silent:false}).catch(console.error);
         showToast('Đăng nhập thành công. Hồ sơ đã được ghép với ' + (cls(matched.classId)?.name || 'lớp đã đăng kí') + '.', 'success');
         showScreen('freePlayScreen');
         return;
@@ -2004,6 +2151,7 @@ function saveDB(){
         saveDB();
         updateSidebar();
         renderAll();
+        if(firebaseUser && !zchemIsConfiguredAdminUser(firebaseUser)) zchemSyncPendingStudentAttempts({silent:true}).catch(console.error);
       }catch(error){
         console.error('Không thể khôi phục phiên Firebase:', error);
       }
@@ -2400,11 +2548,11 @@ function saveDB(){
               <div class="section-title">
                 <div>
                   <h3>Học sinh</h3>
-                  <p>Đăng nhập Google, sau đó đăng kí họ tên, ngày sinh và lớp để hệ thống ghép với danh sách lớp.</p>
+                  <p>Đăng nhập Google. Lần đầu học sinh đăng kí họ tên và ngày sinh; những lần sau hệ thống tự nhận diện tài khoản.</p>
                 </div>
               </div>
               <button class="btn secondary" onclick="loginStudentWithGoogle()" style="width:100%;margin-top:8px">Đăng nhập học sinh bằng Google</button>
-              <div class="tiny muted" style="margin-top:12px">Sau khi đăng nhập Google lần đầu, học sinh nhập đúng họ tên, ngày sinh và lớp. Hệ thống đối chiếu danh sách lớp; nếu khớp sẽ tự cập nhật email, nếu không khớp sẽ đưa vào Lớp tự do.</div>
+              <div class="tiny muted" style="margin-top:12px">Chỉ đăng kí thông tin ở lần đầu. Các lần sau, học sinh chỉ cần bấm đăng nhập Google, hệ thống tự khôi phục hồ sơ đã đăng kí.</div>
             </div>
           </div>
 
@@ -3377,7 +3525,10 @@ function saveDB(){
     attempt.firebaseSyncStatus = 'pending';
     db.attempts.push(attempt);
     saveDB();
-    await saveAttemptToFirebase(attempt);
+    const syncedToFirebase = await saveAttemptToFirebase(attempt);
+    if(syncedToFirebase){
+      showToast('Bài làm đã được đồng bộ lên Firebase.', 'success');
+    }
 
     // reset quiz before showing result so leaderboard can refresh
     state.quiz = null; state.questionIndex=0; state.answers={}; state.confirmedAnswers={}; state.feedback=null;
