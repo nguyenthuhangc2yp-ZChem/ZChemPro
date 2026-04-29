@@ -351,6 +351,7 @@
   let zchemRealtimeWriteTimer = null;
   let zchemRealtimeLastJson = '';
   let zchemRealtimeMainListenerStarted = false;
+  let zchemAdminStudentProfileListenersStarted = false;
   const zchemPendingRealtimeDeletes = new Set();
   const zchemPendingRootDeletes = new Set();
   let zchemRealtimeInitPromise = null;
@@ -861,6 +862,7 @@ function zchemStopAllRealtimeListeners(){
     delete zchemRealtimeListeners[key];
   });
   zchemRealtimeMainListenerStarted = false;
+  zchemAdminStudentProfileListenersStarted = false;
   zchemRealtimeInitPromise = null;
   zchemInitResultPathListeners.started = false;
   if(zchemPresenceRef){
@@ -1007,6 +1009,146 @@ function zchemMergeCloudAttempts(cloudAttempts){
   db = zchemNormalizeDB(db);
   zchemPersistLocalDB();
   if(typeof renderAll === 'function') renderAll();
+}
+
+
+function zchemStudentRecordsFromUserProfile(uid, profile){
+  if(!uid || !profile || typeof profile !== 'object') return [];
+  if(profile.role && profile.role !== 'student') return [];
+  const email = normalizeEmail(profile.email || '');
+  const classIds = Array.from(new Set([
+    ...asArray(profile.classIds),
+    ...Object.keys(profile.classes || {}),
+    profile.classId || ''
+  ].filter(Boolean)));
+  const finalClassIds = classIds.length ? classIds : [getFreeClassId()];
+  const displayName = profile.displayName || profile.fullName || profile.name || 'Học sinh';
+  const primaryClassId = profile.classId || finalClassIds[0] || getFreeClassId();
+  return finalClassIds.map(classId=>{
+    const isPrimary = classId === primaryClassId;
+    const classObj = cls(classId);
+    const status = profile.rosterStatus || (classId === getFreeClassId() ? 'free' : 'matched');
+    return {
+      id: (isPrimary && profile.rosterStudentId) ? profile.rosterStudentId : ('profile_' + uid + '_' + zchemFirebasePathKey(classId)),
+      name: displayName,
+      birthDate: normalizeBirthDate(profile.birthDate || ''),
+      email,
+      emailKey: emailKey(email),
+      classId,
+      grade: profile.grade || classObj?.grade || (classId === getFreeClassId() ? 'Tự do' : ''),
+      firebaseUid: uid,
+      rosterStatus: status,
+      linkedAt: profile.linkedAt || nowISO()
+    };
+  });
+}
+
+function zchemStudentRecordFromAuxPayload(item, fallback={}){
+  if(!item || typeof item !== 'object') return null;
+  const uid = item.firebaseUid || fallback.firebaseUid || '';
+  const classId = item.classId || fallback.classId || getFreeClassId();
+  const email = normalizeEmail(item.email || fallback.email || '');
+  const classObj = cls(classId);
+  return {
+    id: item.studentId || item.id || (uid ? ('profile_' + uid + '_' + zchemFirebasePathKey(classId)) : makeId('stu_cloud_')),
+    name: item.fullName || item.displayName || item.name || fallback.fullName || 'Học sinh',
+    birthDate: normalizeBirthDate(item.birthDate || ''),
+    email,
+    emailKey: item.emailKey || emailKey(email),
+    classId,
+    grade: item.grade || classObj?.grade || (classId === getFreeClassId() ? 'Tự do' : ''),
+    firebaseUid: uid,
+    rosterStatus: item.rosterStatus || (classId === getFreeClassId() ? 'free' : 'matched'),
+    linkedAt: item.linkedAt || null
+  };
+}
+
+function zchemUpsertCloudStudentRecords(records){
+  if(!Array.isArray(records) || !records.length) return false;
+  let changed = false;
+  if(!Array.isArray(db.students)) db.students = [];
+  records.filter(Boolean).forEach(raw=>{
+    const student = {
+      birthDate:'', email:'', emailKey:'', rosterStatus:'matched',
+      ...raw,
+      email: normalizeEmail(raw.email || ''),
+      emailKey: raw.emailKey || emailKey(raw.email || ''),
+      birthDate: normalizeBirthDate(raw.birthDate || '')
+    };
+    if(!student.classId) student.classId = getFreeClassId();
+    if(!student.id){
+      student.id = student.firebaseUid ? ('profile_' + student.firebaseUid + '_' + zchemFirebasePathKey(student.classId)) : makeId('stu_cloud_');
+    }
+    const idx = db.students.findIndex(s =>
+      (s && student.id && s.id === student.id) ||
+      (s && student.firebaseUid && s.firebaseUid === student.firebaseUid && s.classId === student.classId) ||
+      (s && student.email && normalizeEmail(s.email || '') === student.email && s.classId === student.classId && normalizeBirthDate(s.birthDate || '') === student.birthDate)
+    );
+    if(idx >= 0){
+      const merged = {...db.students[idx], ...student};
+      if(JSON.stringify(db.students[idx]) !== JSON.stringify(merged)){
+        db.students[idx] = merged;
+        changed = true;
+      }
+    }else{
+      db.students.push(student);
+      changed = true;
+    }
+    ensureLocalMembership(student);
+  });
+  if(changed){
+    db = zchemNormalizeDB(db);
+    zchemPersistLocalDB();
+    if(typeof renderAll === 'function') renderAll();
+  }
+  return changed;
+}
+
+function zchemInitAdminStudentProfileListeners(){
+  if(!zchemRealtimeReady || !zchemDatabase || zchemAdminStudentProfileListenersStarted) return;
+  if(!zchemCurrentAuthIsAdmin()) return;
+  zchemAdminStudentProfileListenersStarted = true;
+
+  zchemRealtimeListen('users', 'value', snap=>{
+    const records = [];
+    Object.entries(snap.val() || {}).forEach(([uid, profile])=>{
+      records.push(...zchemStudentRecordsFromUserProfile(uid, profile));
+    });
+    zchemUpsertCloudStudentRecords(records);
+  }, error=>console.warn('Không đọc được users để đồng bộ học sinh cho admin:', error));
+
+  zchemRealtimeListen('freeStudents', 'value', snap=>{
+    const records = [];
+    Object.entries(snap.val() || {}).forEach(([key, item])=>{
+      const record = zchemStudentRecordFromAuxPayload(item, {firebaseUid: item?.firebaseUid || key, classId:getFreeClassId()});
+      if(record) records.push(record);
+    });
+    zchemUpsertCloudStudentRecords(records);
+  }, error=>console.warn('Không đọc được freeStudents để đồng bộ học sinh cho admin:', error));
+
+  zchemRealtimeListen('classStudents', 'value', snap=>{
+    const records = [];
+    const root = snap.val() || {};
+    Object.entries(root).forEach(([classId, classNode])=>{
+      Object.values(classNode || {}).forEach(item=>{
+        const record = zchemStudentRecordFromAuxPayload(item, {classId});
+        if(record) records.push(record);
+      });
+    });
+    zchemUpsertCloudStudentRecords(records);
+  }, error=>console.warn('Không đọc được classStudents để đồng bộ học sinh cho admin:', error));
+
+  zchemRealtimeListen('studentClassIndex', 'value', snap=>{
+    const records = [];
+    const root = snap.val() || {};
+    Object.entries(root).forEach(([mailKey, classMap])=>{
+      Object.values(classMap || {}).forEach(item=>{
+        const record = zchemStudentRecordFromAuxPayload(item, {email: String(mailKey || '').replace(/_/g,'.')});
+        if(record) records.push(record);
+      });
+    });
+    zchemUpsertCloudStudentRecords(records);
+  }, error=>console.warn('Không đọc được studentClassIndex để đồng bộ học sinh cho admin:', error));
 }
 
 function zchemInitResultPathListeners(isAdmin=false){
@@ -1223,6 +1365,7 @@ async function zchemInitAdminRealtimeDatabaseSync(){
   }
   zchemStartPresence();
   zchemInitResultPathListeners(true);
+  zchemInitAdminStudentProfileListeners();
   return true;
 }
 
