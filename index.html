@@ -723,11 +723,32 @@ function zchemNormalizeDB(data){
     .filter(q => q && typeof q === 'object')
     .map(q => {
       const copy = normalizeQuestionItem(q);
-      copy.classIds = copy.classIds.filter(id => validClassIds.has(id));
+      copy.classIds = Array.isArray(copy.classIds) ? copy.classIds.filter(id => validClassIds.has(id)) : [];
       if(!copy.classIds.length && copy.classId && validClassIds.has(copy.classId)) copy.classIds = [copy.classId];
-      if(!copy.classIds.length && normalized.classes.length) copy.classIds = [freeId];
+
+      const officialByGrade = normalized.classes.filter(c => c.id !== freeId && c.name !== 'Lớp tự do' && c.classType !== 'free' && String(c.grade || '') === String(copy.grade || ''));
+      const linkedOnlyToFree = copy.classIds.length === 1 && copy.classIds[0] === freeId;
+      const hasOfficialGrade = copy.grade && String(copy.grade) !== 'Tự do';
+
+      // Sửa dữ liệu cũ bị lỗi: grade là khối chính thức nhưng classIds lại bị gán về Lớp tự do.
+      // Chỉ tự sửa khi xác định chắc chắn duy nhất 1 lớp chính thức cùng khối.
+      if(linkedOnlyToFree && hasOfficialGrade && officialByGrade.length === 1){
+        copy.classIds = [officialByGrade[0].id];
+        copy.grade = officialByGrade[0].grade || copy.grade;
+        copy.repairedClassLinkAt = copy.repairedClassLinkAt || new Date().toISOString();
+        copy.invalidClassLink = false;
+      }
+
+      // Không fallback câu hỏi về class_free_auto nữa. Nếu không xác định được lớp hợp lệ,
+      // đánh dấu để admin sửa thay vì âm thầm đưa câu hỏi vào Lớp tự do.
+      if(!copy.classIds.length){
+        copy.invalidClassLink = true;
+      }else if(!(linkedOnlyToFree && hasOfficialGrade && officialByGrade.length !== 1)){
+        copy.invalidClassLink = false;
+      }
+
       const firstClass = normalized.classes.find(c => copy.classIds.includes(c.id));
-      if(!copy.grade && firstClass) copy.grade = firstClass.grade || '';
+      if(firstClass) copy.grade = firstClass.grade || copy.grade || '';
       return copy;
     });
 
@@ -1434,6 +1455,11 @@ async function zchemInitAdminRealtimeDatabaseSync(){
   zchemInitResultPathListeners(true);
   zchemInitAdminStudentProfileListeners();
   zchemEnsureIdentityIndexForRosterStudents();
+  try{
+    repairQuestionsWronglyLinkedToFreeClass({persist:true});
+  }catch(error){
+    console.warn('Không tự sửa được liên kết lớp của câu hỏi:', error);
+  }
   return true;
 }
 
@@ -1893,7 +1919,71 @@ function saveDB(){
   }
 
   function officialClasses(){
-    return db.classes.filter(c => c.id !== getFreeClassId() && c.name !== 'Lớp tự do');
+    if(!Array.isArray(db.classes)) return [];
+    const freeClassId = getFreeClassId();
+    return db.classes.filter(c => c && c.id !== freeClassId && c.name !== 'Lớp tự do' && c.classType !== 'free');
+  }
+
+  function officialGrades(){
+    return [...new Set(officialClasses().map(c => String(c.grade || '').trim()).filter(Boolean))];
+  }
+
+  function resolveQuestionTargets(scope, classId, gradeValue){
+    const official = officialClasses();
+    const selectedScope = scope || 'class';
+    if(!official.length){
+      throw new Error('Chưa có lớp chính thức. Vui lòng tạo lớp trước khi thêm câu hỏi.');
+    }
+
+    if(selectedScope === 'grade'){
+      const grade = String(gradeValue || '').trim();
+      if(!grade) throw new Error('Vui lòng chọn khối áp dụng.');
+      const targetClassIds = official.filter(c => String(c.grade || '') === grade).map(c => c.id);
+      if(!targetClassIds.length) throw new Error('Khối này chưa có lớp chính thức. Vui lòng tạo lớp hoặc chọn khối khác.');
+      return {classIds: targetClassIds, grade};
+    }
+
+    const selectedClass = official.find(c => c.id === classId);
+    if(!selectedClass){
+      throw new Error('Vui lòng chọn một lớp chính thức hợp lệ trước khi lưu câu hỏi.');
+    }
+    return {classIds: [selectedClass.id], grade: selectedClass.grade || ''};
+  }
+
+  function repairQuestionsWronglyLinkedToFreeClass(options={}){
+    if(!Array.isArray(db.questionBank)) return false;
+    const freeClassId = getFreeClassId();
+    const official = officialClasses();
+    let changed = false;
+    db.questionBank = db.questionBank.map(q => {
+      if(!q || typeof q !== 'object') return q;
+      const copy = {...q};
+      copy.classIds = Array.isArray(copy.classIds) ? copy.classIds.filter(Boolean) : [];
+      const linkedOnlyToFree = copy.classIds.length === 1 && copy.classIds[0] === freeClassId;
+      const hasOfficialGrade = copy.grade && String(copy.grade) !== 'Tự do';
+      if(linkedOnlyToFree && hasOfficialGrade){
+        const candidates = official.filter(c => String(c.grade || '') === String(copy.grade || ''));
+        if(candidates.length === 1){
+          copy.classIds = [candidates[0].id];
+          copy.grade = candidates[0].grade || copy.grade;
+          copy.invalidClassLink = false;
+          copy.repairedClassLinkAt = copy.repairedClassLinkAt || nowISO();
+          changed = true;
+        }else{
+          copy.invalidClassLink = true;
+          changed = true;
+        }
+      }else if(!copy.classIds.length){
+        copy.invalidClassLink = true;
+        changed = true;
+      }
+      return copy;
+    });
+    if(changed && options.persist){
+      showToast('Đã rà soát và sửa/đánh dấu các câu hỏi bị gắn nhầm lớp.', 'warn');
+      saveDB();
+    }
+    return changed;
   }
 
   function ensureLocalMembership(student){
@@ -4694,11 +4784,11 @@ function saveDB(){
               </div>
               <div class="field" id="qClassFieldWrap">
                 <label>Lớp áp dụng</label>
-                <select id="qClassField" class="input">${db.classes.map(c=>`<option value="${c.id}">${c.name}</option>`).join('')}</select>
+                <select id="qClassField" class="input">${officialClasses().map(c=>`<option value="${c.id}">${esc(c.name)} - Khối ${esc(c.grade)}</option>`).join('')}</select>
               </div>
               <div class="field hidden" id="qGradeFieldWrap">
                 <label>Khối áp dụng</label>
-                <select id="qGradeField" class="input">${[...new Set(db.classes.map(c=>c.grade))].map(g=>`<option value="${g}">Khối ${g}</option>`).join('')}</select>
+                <select id="qGradeField" class="input">${officialGrades().map(g=>`<option value="${esc(g)}">Khối ${esc(g)}</option>`).join('')}</select>
               </div>
               <div class="field">
                 <label>Chế độ</label>
@@ -5151,21 +5241,26 @@ function saveDB(){
     const options = $('qOptionsField').value.split('\\n').map(x=>x.trim()).filter(Boolean);
     const mediaUrl = $('qMediaField').value.trim();
     const scope = $('qBankScopeField')?.value || 'class';
-    const classId = $('qClassField').value;
+    const classId = $('qClassField')?.value || '';
     const gradeValue = $('qGradeField')?.value || '';
     const mode = $('qModeField').value;
     const format = $('qFormatField').value;
     if(!content){ showToast('Vui lòng nhập nội dung câu hỏi.', 'error'); return; }
 
-    const classIds = scope === 'grade'
-      ? db.classes.filter(c=>c.grade===gradeValue).map(c=>c.id)
-      : [classId];
+    let targets;
+    try{
+      targets = resolveQuestionTargets(scope, classId, gradeValue);
+    }catch(error){
+      showToast(error.message || 'Lớp áp dụng không hợp lệ.', 'error');
+      return;
+    }
 
     const q = {
       id: state.editingQuestionId || makeId('q_'),
       type, content, points,
-      grade: scope === 'grade' ? gradeValue : (cls(classId)?.grade || ''),
-      classIds,
+      grade: targets.grade,
+      classIds: targets.classIds,
+      invalidClassLink: false,
       mode, format
     };
 
@@ -5212,9 +5307,10 @@ function saveDB(){
     $('qBankScopeField').value = isGradeScope ? 'grade' : 'class';
     toggleQuestionBankScopeFields();
     if(!isGradeScope){
-      $('qClassField').value = q.classIds?.[0] || db.classes[0]?.id;
+      const firstOfficial = officialClasses()[0]?.id || '';
+      $('qClassField').value = (q.classIds || []).find(id => officialClasses().some(c => c.id === id)) || firstOfficial;
     }else{
-      $('qGradeField').value = q.grade || db.classes[0]?.grade || '';
+      $('qGradeField').value = q.grade || officialGrades()[0] || '';
     }
     $('qModeField').value = q.mode || 'both';
     $('qFormatField').value = q.format || 'both';
