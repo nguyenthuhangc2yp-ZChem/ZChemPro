@@ -3,7 +3,7 @@
 <head>
   <meta charset="UTF-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1.0" />
-  <title>ZChem Classroom - Học Hóa cùng cô Hằng | ZChemPro1</title>
+  <title>ZChem Classroom - Học Hóa cùng cô Hằng | ZChemPro2</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
   <link href="https://fonts.googleapis.com/css2?family=Be+Vietnam+Pro:wght@400;500;600;700;800&display=swap" rel="stylesheet">
@@ -290,7 +290,7 @@
         <div class="tiny" style="color:#d8eeff;margin-top:8px">Có thể bật/tắt và điều chỉnh âm lượng, trạng thái được lưu lại.</div>
       </div>
 
-      <div class="footer-note">Phiên bản 01 • Đồng bộ Firebase • Khóa màn hình • Đảo câu hỏi/đáp án • 1 file HTML</div>
+      <div class="footer-note">Phiên bản 02 • Đồng bộ Firebase • Khóa màn hình • Đảo câu hỏi/đáp án • 1 file HTML</div>
     </aside>
 
     <main class="main">
@@ -322,6 +322,7 @@
   // =========================================================
   const ZCHEM_ADMIN_UID = 'EPpvlVQXZqNbUq58RuoMPyc3Mrl1';
   const ZCHEM_ADMIN_EMAIL = 'nguyenthuhangc2yp@bacninh.edu.vn';
+  const ZCHEM_ADMIN_SESSION_KEY = 'zchem_admin_session_active_v2';
 
   // Đã bổ sung databaseURL của Realtime Database.
   const ZCHEM_DATABASE_URL = 'https://zchem-c8dd9-default-rtdb.asia-southeast1.firebasedatabase.app';
@@ -342,12 +343,21 @@
   let zchemFirebaseReady = false;
   let zchemRealtimeReady = false;
   const ZCHEM_APPDATA_PATH = 'appData/current';
+  // Các mảng lớn được lưu trong Firebase theo dạng object keyed-by-id để giảm ghi đè khi nhiều thiết bị/admin cùng thao tác.
+  const ZCHEM_ENTITY_COLLECTION_KEYS = ['users','classes','students','questionBank','monthlyExams','gradeBanks','examExitLogs'];
+  const ZCHEM_META_OBJECT_KEYS = ['settings','classMembers','studentClasses','roster'];
   let zchemRealtimeHydrated = false;
   let zchemRealtimeApplying = false;
   let zchemRealtimeWriteTimer = null;
   let zchemRealtimeLastJson = '';
   let zchemRealtimeMainListenerStarted = false;
+  const zchemPendingRealtimeDeletes = new Set();
+  const zchemPendingRootDeletes = new Set();
   let zchemRealtimeInitPromise = null;
+  let zchemAdminSessionActive = false;
+  let zchemAdminSessionUid = '';
+  let zchemAdminSessionEmail = '';
+  let zchemAdminLoginInProgress = false;
   const zchemRealtimeListeners = {};
   let zchemPresenceRef = null;
   let zchemConnectedRef = null;
@@ -359,7 +369,7 @@
     if(window.firebase) {
       zchemAuth = firebase.auth();
       if(firebase.auth && firebase.auth.Auth && firebase.auth.Auth.Persistence){
-        zchemAuth.setPersistence(firebase.auth.Auth.Persistence.NONE).catch(()=>{});
+        zchemAuth.setPersistence(firebase.auth.Auth.Persistence.LOCAL).catch(()=>{});
       }
       zchemFirebaseReady = true;
       if(ZCHEM_DATABASE_URL) {
@@ -496,6 +506,82 @@
   const STORAGE_KEY = 'zchem-stable';
 function clone(obj){ return JSON.parse(JSON.stringify(obj)); }
 
+function makeId(prefix='id_'){ return prefix + Math.random().toString(36).slice(2,9); }
+
+function asArray(value){
+  if(Array.isArray(value)) return value.filter(v => v !== undefined && v !== null);
+  if(value === undefined || value === null || value === '') return [];
+  if(typeof value === 'object'){
+    const entries = Object.entries(value);
+    if(!entries.length) return [];
+    const looksLikeFlagMap = entries.every(([,v]) => typeof v === 'boolean' || v === 0 || v === 1);
+    if(looksLikeFlagMap) return entries.filter(([,v]) => !!v).map(([k]) => k);
+    return entries.map(([,v]) => v).filter(v => v !== undefined && v !== null);
+  }
+  return [value];
+}
+
+function asPlainObject(value){
+  return value && typeof value === 'object' && !Array.isArray(value) ? value : {};
+}
+
+function normalizeQuestionItem(q){
+  const copy = (q && typeof q === 'object') ? {...q} : {};
+  copy.id = copy.id || makeId('q_');
+  copy.content = String(copy.content || '');
+  copy.type = copy.type || 'single';
+  copy.mode = ['free','exam','both'].includes(copy.mode) ? copy.mode : 'both';
+  copy.format = ['individual','group','both'].includes(copy.format) ? copy.format : 'both';
+  copy.classIds = asArray(copy.classIds || copy.classId).map(String).filter(Boolean);
+  copy.grade = String(copy.grade || '');
+  copy.points = Number(copy.points || 10);
+  if(!Number.isFinite(copy.points) || copy.points <= 0) copy.points = 10;
+
+  if(['single','multiple','media'].includes(copy.type)){
+    copy.options = asArray(copy.options).map(x => String(x));
+    if(copy.type === 'multiple') copy.answer = asArray(copy.answer).map(x => String(x));
+    else copy.answer = String(Array.isArray(copy.answer) ? (copy.answer[0] || '') : (copy.answer || ''));
+  }else if(copy.type === 'match'){
+    copy.pairs = asArray(copy.pairs).map(pair => {
+      if(pair && typeof pair === 'object') return {left:String(pair.left || ''), right:String(pair.right || '')};
+      const parts = String(pair || '').split('|');
+      return {left:parts[0] || '', right:parts.slice(1).join('|') || ''};
+    }).filter(pair => pair.left || pair.right);
+    copy.answer = asArray(copy.answer).map(x => String(x));
+    if(!copy.answer.length && copy.pairs.length) copy.answer = copy.pairs.map(pair => `${pair.left}|${pair.right}`);
+  }else if(copy.type === 'table'){
+    copy.tablePrompt = asArray(copy.tablePrompt).map(row => asArray(row).map(cell => String(cell)));
+    copy.answer = asArray(copy.answer).map(x => String(x));
+  }else if(copy.type === 'upload'){
+    copy.accept = copy.accept || 'audio/*,video/*';
+  }else{
+    copy.answer = Array.isArray(copy.answer) ? copy.answer.map(x => String(x)) : String(copy.answer || '');
+  }
+  return copy;
+}
+
+function normalizeAttemptItem(a){
+  const copy = (a && typeof a === 'object') ? {...a} : {};
+  copy.id = copy.id || makeId('a_');
+  copy.details = asArray(copy.details).filter(d => d && typeof d === 'object').map(d => ({q:String(d.q || ''), correct:!!d.correct, ...d}));
+  copy.score = Number(copy.score || 0);
+  copy.total = Number(copy.total || 0);
+  if(!Number.isFinite(copy.score)) copy.score = 0;
+  if(!Number.isFinite(copy.total)) copy.total = 0;
+  return copy;
+}
+
+function normalizeClassItem(c){
+  const copy = (c && typeof c === 'object') ? {...c} : {};
+  copy.id = copy.id || makeId('class_');
+  copy.name = String(copy.name || 'Lớp chưa đặt tên');
+  copy.grade = String(copy.grade || '');
+  copy.modes = asArray(copy.modes).map(String).filter(m => ['free','exam'].includes(m));
+  if(!copy.modes.length) copy.modes = ['free','exam'];
+  delete copy[['tea','cherId'].join('')];
+  return copy;
+}
+
 function mergeByIdPreserveExisting(oldList = [], newList = []){
   const map = new Map();
   oldList.forEach(item => {
@@ -509,7 +595,7 @@ function mergeByIdPreserveExisting(oldList = [], newList = []){
 }
 
 function migrateData(oldData = {}, demoData = {}){
-  // ZChemPro1: không tự trộn lại dữ liệu DEMO vào dữ liệu thật khi nâng phiên bản.
+  // ZChemPro2: không tự trộn lại dữ liệu DEMO vào dữ liệu thật khi nâng phiên bản.
   // Nếu admin đã xóa lớp/học sinh demo, bản nâng cấp sẽ giữ nguyên trạng thái đã xóa.
   const migrated = {...oldData};
   migrated.dataVersion = demoData.dataVersion || oldData.dataVersion || 1;
@@ -604,31 +690,147 @@ function zchemNormalizeDB(data){
   const incoming = (data && typeof data === 'object') ? clone(data) : {};
   const normalized = {...zchemCreateEmptyDB(), ...incoming};
   normalized.dataVersion = incoming.dataVersion || DEMO.dataVersion || 1;
-  normalized.settings = {...(DEMO.settings || {}), ...(incoming.settings || {})};
+  normalized.settings = {...(DEMO.settings || {}), ...asPlainObject(incoming.settings)};
   if(typeof normalized.settings.currentUser === 'undefined') normalized.settings.currentUser = null;
+
   ['users','classes','students','questionBank','monthlyExams','attempts','gradeBanks','examExitLogs'].forEach(key=>{
-    if(!Array.isArray(normalized[key])) normalized[key] = [];
+    normalized[key] = asArray(normalized[key]);
   });
+
+  normalized.users = normalized.users
+    .filter(u => u && typeof u === 'object')
+    .map(u => ({...u, id:u.id || makeId('u_'), role:u.role || 'student'}));
+
   normalized.classes = normalized.classes
-    .filter(c => c && c.id)
-    .map(c => { const copy = {...c}; delete copy[['tea','cherId'].join('')]; return copy; });
+    .filter(c => c && typeof c === 'object')
+    .map(normalizeClassItem);
+
   if(!normalized.classes.find(c => c.id === 'class_free_auto')){
     normalized.classes.push({id:'class_free_auto', name:'Lớp tự do', grade:'Tự do', classType:'free', classTypeName:'Tự do', modes:['free']});
   }
+
   normalized.students = normalized.students
-    .filter(st => st && st.id)
-    .map(st=>({birthDate:'', email:'', emailKey:'', rosterStatus:'waiting', ...st}));
+    .filter(st => st && typeof st === 'object')
+    .map(st=>({id:st.id || makeId('stu_'), birthDate:'', email:'', emailKey:'', rosterStatus:'waiting', ...st}));
+
+  const validClassIds = new Set(normalized.classes.map(c => c.id));
+  const freeId = normalized.classes.find(c => c.id === 'class_free_auto')?.id || 'class_free_auto';
+
+  normalized.questionBank = normalized.questionBank
+    .filter(q => q && typeof q === 'object')
+    .map(q => {
+      const copy = normalizeQuestionItem(q);
+      copy.classIds = copy.classIds.filter(id => validClassIds.has(id));
+      if(!copy.classIds.length && copy.classId && validClassIds.has(copy.classId)) copy.classIds = [copy.classId];
+      if(!copy.classIds.length && normalized.classes.length) copy.classIds = [freeId];
+      const firstClass = normalized.classes.find(c => copy.classIds.includes(c.id));
+      if(!copy.grade && firstClass) copy.grade = firstClass.grade || '';
+      return copy;
+    });
+
+  normalized.attempts = normalized.attempts.map(normalizeAttemptItem);
+
+  normalized.monthlyExams = normalized.monthlyExams
+    .filter(ex => ex && typeof ex === 'object')
+    .map(ex => ({...ex, id:ex.id || makeId('exam_'), title:String(ex.title || 'Kỳ thi'), scope:ex.scope || 'class'}));
+
+  normalized.gradeBanks = normalized.gradeBanks
+    .filter(item => item && typeof item === 'object')
+    .map(item => ({...item, id:item.id || makeId('gb_')}));
+
   ['classMembers','studentClasses','roster'].forEach(key=>{
-    if(!normalized[key] || typeof normalized[key] !== 'object' || Array.isArray(normalized[key])) normalized[key] = {};
+    normalized[key] = asPlainObject(normalized[key]);
   });
+
   return normalized;
 }
 
+function zchemFirebasePathKey(id){
+  const key = String(id || '').trim().replace(/[.#$\[\]\/]/g, '_');
+  return key || makeId('node_');
+}
+
+function zchemQueueCloudDelete(collection, id){
+  if(!collection || !id) return;
+  zchemPendingRealtimeDeletes.add(String(collection) + '/' + zchemFirebasePathKey(id));
+}
+
+function zchemQueueCloudPathDelete(path){
+  if(!path) return;
+  zchemPendingRealtimeDeletes.add(String(path).replace(/^\/+/, ''));
+}
+
+function zchemQueueRootPathDelete(path){
+  if(!path) return;
+  zchemPendingRootDeletes.add(String(path).replace(/^\/+/, ''));
+}
+
+function zchemCollectionToObject(items){
+  const out = {};
+  asArray(items).filter(item => item && typeof item === 'object').forEach(item => {
+    const copy = {...item};
+    if(!copy.id) copy.id = makeId('item_');
+    out[zchemFirebasePathKey(copy.id)] = copy;
+  });
+  return out;
+}
+
+function zchemCanonicalCloudDB(sourceDB){
+  const normalized = zchemNormalizeDB(sourceDB || DEMO);
+  const cloud = {
+    dataVersion: normalized.dataVersion || DEMO.dataVersion || 1,
+    realtimeUpdatedAt: normalized.realtimeUpdatedAt || new Date().toISOString()
+  };
+  ZCHEM_ENTITY_COLLECTION_KEYS.forEach(key => {
+    cloud[key] = zchemCollectionToObject(normalized[key]);
+  });
+  ZCHEM_META_OBJECT_KEYS.forEach(key => {
+    cloud[key] = clone(normalized[key] || {});
+  });
+  if(cloud.settings) cloud.settings.currentUser = null;
+  return cloud;
+}
+
+function zchemBuildRealtimeUpdatePayload(nextPayload, previousPayload){
+  const prev = previousPayload && typeof previousPayload === 'object' ? previousPayload : {};
+  const updates = {};
+  const setIfChanged = (path, value, oldValue) => {
+    if(JSON.stringify(value ?? null) !== JSON.stringify(oldValue ?? null)) updates[path] = value;
+  };
+
+  Object.keys(nextPayload || {}).forEach(key => {
+    if(ZCHEM_ENTITY_COLLECTION_KEYS.includes(key)) return;
+    setIfChanged(key, nextPayload[key], prev[key]);
+  });
+
+  ZCHEM_ENTITY_COLLECTION_KEYS.forEach(key => {
+    const nextNode = nextPayload[key] && typeof nextPayload[key] === 'object' ? nextPayload[key] : {};
+    const prevNode = prev[key] && typeof prev[key] === 'object' ? prev[key] : {};
+    const nextKeys = Object.keys(nextNode);
+
+    if(!Object.keys(prevNode).length && nextKeys.length){
+      updates[key] = nextNode;
+      return;
+    }
+
+    nextKeys.forEach(id => {
+      if(JSON.stringify(nextNode[id] ?? null) !== JSON.stringify(prevNode[id] ?? null)){
+        updates[key + '/' + zchemFirebasePathKey(id)] = nextNode[id];
+      }
+    });
+  });
+
+  // Không suy luận xóa dữ liệu từ snapshot cũ để tránh xóa nhầm khi nhiều admin cùng chỉnh.
+  // Chỉ xóa node đã được đánh dấu từ hành động xóa thật của người dùng.
+  zchemPendingRealtimeDeletes.forEach(path => { updates[path] = null; });
+
+  return Object.keys(updates).length ? updates : null;
+}
+
 function zchemCloudSafeDB(){
-  const copy = clone(db || DEMO);
-  if(copy.settings) copy.settings.currentUser = null;
-  copy.realtimeUpdatedAt = new Date().toISOString();
-  return copy;
+  const payload = zchemCanonicalCloudDB(db || DEMO);
+  payload.realtimeUpdatedAt = new Date().toISOString();
+  return payload;
 }
 
 
@@ -681,7 +883,7 @@ function zchemStartPresence(){
       zchemPresenceRef.set({
         online:true,
         email:zchemAuth.currentUser.email || '',
-        role:(zchemAuth.currentUser.uid === ZCHEM_ADMIN_UID || zchemAuth.currentUser.email === ZCHEM_ADMIN_EMAIL) ? 'admin' : 'student',
+        role:zchemCurrentAuthIsAdmin() ? 'admin' : 'student',
         lastSeen: firebase.database.ServerValue.TIMESTAMP
       }).catch(()=>{});
       zchemPresenceRef.onDisconnect().set({
@@ -702,10 +904,22 @@ function zchemScheduleRealtimeSave(force=false){
       const payload = zchemCloudSafeDB();
       const json = JSON.stringify(payload);
       if(!force && json === zchemRealtimeLastJson) return;
+      let previousPayload = {};
+      try{ previousPayload = zchemRealtimeLastJson ? JSON.parse(zchemRealtimeLastJson) : {}; }catch(error){ previousPayload = {}; }
+      const updates = zchemBuildRealtimeUpdatePayload(payload, previousPayload);
+      const rootDeleteUpdates = {};
+      zchemPendingRootDeletes.forEach(path => { rootDeleteUpdates[path] = null; });
+      const hasRootDeletes = Object.keys(rootDeleteUpdates).length > 0;
+      if(!updates && !hasRootDeletes) return;
+      // Ghi multi-location theo từng bản ghi thay vì thay nguyên node lớn.
+      // Cách này giảm băng thông và hạn chế ghi đè khi nhiều thiết bị/admin cùng thao tác.
+      if(updates) await zchemDatabase.ref(ZCHEM_APPDATA_PATH).update(updates);
+      // Dọn dữ liệu ở các nhánh root như results/freePlayResults/roster khi người dùng thật sự xóa.
+      // Không đặt các path này dưới appData/current để tránh xóa sai vị trí.
+      if(hasRootDeletes) await zchemDatabase.ref().update(rootDeleteUpdates);
       zchemRealtimeLastJson = json;
-      // ZChemPro1: dùng update() theo các nhánh con trong appData/current thay vì set() nguyên node.
-      // Các mảng chính vẫn được thay thế nguyên child nên thao tác xóa lớp/học sinh không bị quay lại.
-      await zchemDatabase.ref(ZCHEM_APPDATA_PATH).update(payload);
+      zchemPendingRealtimeDeletes.clear();
+      zchemPendingRootDeletes.clear();
     }catch(error){
       console.error('Không đồng bộ được dữ liệu chính lên Realtime Database:', error);
     }
@@ -720,12 +934,50 @@ function zchemApplyRealtimeDB(cloudData){
   zchemRealtimeApplying = true;
   try{
     db = normalized;
-    localStorage.setItem(STORAGE_KEY, JSON.stringify(db));
-    zchemRealtimeLastJson = JSON.stringify(zchemCloudSafeDB());
+    zchemPersistLocalDB();
+    zchemRealtimeLastJson = JSON.stringify(zchemCanonicalCloudDB(db));
   }finally{
     zchemRealtimeApplying = false;
   }
   return true;
+}
+
+
+function zchemApplyRealtimeNode(nodeKey, nodeValue){
+  if(!nodeKey) return false;
+  const currentUser = db && db.settings ? db.settings.currentUser : null;
+  const patch = {};
+  patch[nodeKey] = nodeValue;
+  const normalizedPatch = zchemNormalizeDB(patch);
+  zchemRealtimeApplying = true;
+  try{
+    if(ZCHEM_ENTITY_COLLECTION_KEYS.includes(nodeKey)){
+      db[nodeKey] = normalizedPatch[nodeKey] || [];
+    }else if(ZCHEM_META_OBJECT_KEYS.includes(nodeKey) || nodeKey === 'settings'){
+      db[nodeKey] = normalizedPatch[nodeKey] || {};
+    }else if(nodeKey === 'dataVersion'){
+      db.dataVersion = nodeValue || db.dataVersion || DEMO.dataVersion;
+    }else if(nodeKey === 'realtimeUpdatedAt'){
+      db.realtimeUpdatedAt = nodeValue || '';
+    }else{
+      db[nodeKey] = nodeValue;
+    }
+    if(currentUser){
+      if(!db.settings || typeof db.settings !== 'object') db.settings = {};
+      db.settings.currentUser = currentUser;
+    }
+    db = zchemNormalizeDB(db);
+    zchemPersistLocalDB();
+    zchemRealtimeLastJson = JSON.stringify(zchemCanonicalCloudDB(db));
+  }finally{
+    zchemRealtimeApplying = false;
+  }
+  return true;
+}
+
+function zchemApplyStudentPublicNode(nodeKey, nodeValue){
+  if(!['classes','questionBank','monthlyExams','gradeBanks','settings','dataVersion','realtimeUpdatedAt'].includes(nodeKey)) return false;
+  return zchemApplyRealtimeNode(nodeKey, nodeValue);
 }
 
 function zchemFlattenCloudResults(resultsRoot, freeRoot){
@@ -750,13 +1002,16 @@ function zchemMergeCloudAttempts(cloudAttempts){
   const keyOf = a => String(a.id || [a.examId, a.classId, a.firebaseUid || a.studentName, a.submittedAt].join('@@'));
   const cloudKeys = new Set(cloudAttempts.map(keyOf));
   const localOnly = (db.attempts || []).filter(a => !cloudKeys.has(keyOf(a)));
-  db.attempts = [...localOnly, ...cloudAttempts];
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(db));
+  db.attempts = [...localOnly, ...cloudAttempts].map(normalizeAttemptItem);
+  db = zchemNormalizeDB(db);
+  zchemPersistLocalDB();
   if(typeof renderAll === 'function') renderAll();
 }
 
-function zchemInitResultPathListeners(){
+function zchemInitResultPathListeners(isAdmin=false){
   if(!zchemRealtimeReady || !zchemDatabase || zchemInitResultPathListeners.started) return;
+  const uid = zchemAuth?.currentUser?.uid || '';
+  if(!isAdmin && !uid) return;
   zchemInitResultPathListeners.started = true;
   let resultsCache = {};
   let freeCache = {};
@@ -768,48 +1023,184 @@ function zchemInitResultPathListeners(){
       zchemRealtimeApplying = false;
     }
   };
-  zchemRealtimeListen('results', 'value', snap=>{ resultsCache = snap.val() || {}; apply(); }, err=>console.warn('Không đọc được results:', err));
-  zchemRealtimeListen('freePlayResults', 'value', snap=>{ freeCache = snap.val() || {}; apply(); }, err=>console.warn('Không đọc được freePlayResults:', err));
+
+  if(isAdmin){
+    zchemRealtimeListen('results', 'value', snap=>{ resultsCache = snap.val() || {}; apply(); }, err=>console.warn('Không đọc được results:', err));
+    zchemRealtimeListen('freePlayResults', 'value', snap=>{ freeCache = snap.val() || {}; apply(); }, err=>console.warn('Không đọc được freePlayResults:', err));
+    return;
+  }
+
+  // Học sinh không nghe toàn bộ results/freePlayResults; chỉ nghe lịch sử của chính tài khoản hiện tại.
+  zchemRealtimeListen('freePlayResults/' + uid, 'value', snap=>{
+    freeCache = uid ? {[uid]: (snap.val() || {})} : {};
+    apply();
+  }, err=>console.warn('Không đọc được freePlayResults của học sinh:', err));
+
+  // Kết quả thi theo exam/class được ghi khi nộp bài. Học sinh không cần nghe toàn bộ bảng điểm của lớp.
 }
 
-async function zchemInitRealtimeDatabaseSync(){
+async function zchemLoadStudentMembershipData(firebaseUser){
+  if(!firebaseUser || !zchemRealtimeReady || !zchemDatabase) return;
+  const uid = firebaseUser.uid;
+  const key = emailKey(firebaseUser.email || '');
+  const studentsToMerge = [];
+  const classIds = new Set();
+
+  try{
+    const userSnap = await zchemDatabase.ref('users/' + uid).once('value');
+    const userData = userSnap.val() || {};
+    if(userData.classId) classIds.add(userData.classId);
+    Object.keys(userData.classes || {}).forEach(id=>classIds.add(id));
+    asArray(userData.classIds).forEach(id=>classIds.add(id));
+  }catch(error){ console.warn('Không đọc được hồ sơ user:', error); }
+
+  try{
+    const clsSnap = await zchemDatabase.ref('studentClasses/' + uid).once('value');
+    Object.keys(clsSnap.val() || {}).forEach(id=>classIds.add(id));
+  }catch(error){ console.warn('Không đọc được studentClasses:', error); }
+
+  if(key){
+    try{
+      const idxSnap = await zchemDatabase.ref('studentClassIndex/' + key).once('value');
+      Object.values(idxSnap.val() || {}).forEach(item=>{
+        if(item && typeof item === 'object'){
+          if(item.classId) classIds.add(item.classId);
+          studentsToMerge.push({
+            id: item.studentId || makeId('stu_idx_'),
+            name: item.fullName || '',
+            birthDate: normalizeBirthDate(item.birthDate || ''),
+            email: normalizeEmail(firebaseUser.email || item.email || ''),
+            emailKey: key,
+            classId: item.classId || '',
+            grade: item.grade || '',
+            firebaseUid: uid,
+            rosterStatus: item.rosterStatus || 'matched'
+          });
+        }
+      });
+    }catch(error){ console.warn('Không đọc được studentClassIndex:', error); }
+  }
+
+  for(const classId of Array.from(classIds)){
+    if(!classId) continue;
+    try{
+      const memberSnap = await zchemDatabase.ref('classStudents/' + classId).orderByChild('firebaseUid').equalTo(uid).once('value');
+      Object.values(memberSnap.val() || {}).forEach(item=>{
+        if(item && typeof item === 'object'){
+          studentsToMerge.push({
+            id: item.studentId || makeId('stu_member_'),
+            name: item.fullName || '',
+            birthDate: normalizeBirthDate(item.birthDate || ''),
+            email: normalizeEmail(firebaseUser.email || item.email || ''),
+            emailKey: key || emailKey(item.email || ''),
+            classId: item.classId || classId,
+            grade: item.grade || '',
+            firebaseUid: uid,
+            rosterStatus: item.rosterStatus || 'matched'
+          });
+        }
+      });
+    }catch(error){ console.warn('Không đọc được classStudents:', error); }
+  }
+
+  if(key || uid){
+    try{
+      const freeSnap = await zchemDatabase.ref('freeStudents/' + (key || uid)).once('value');
+      const item = freeSnap.val();
+      if(item && typeof item === 'object'){
+        studentsToMerge.push({
+          id: item.studentId || ('free_' + uid),
+          name: item.fullName || firebaseUser.displayName || 'Học sinh',
+          birthDate: normalizeBirthDate(item.birthDate || ''),
+          email: normalizeEmail(firebaseUser.email || item.email || ''),
+          emailKey: key || emailKey(item.email || ''),
+          classId: item.classId || getFreeClassId(),
+          grade: item.grade || 'Tự do',
+          firebaseUid: uid,
+          rosterStatus: 'free'
+        });
+      }
+    }catch(error){ console.warn('Không đọc được freeStudents:', error); }
+  }
+
+  const seen = new Set(db.students.map(s=>s.id));
+  studentsToMerge.forEach(student=>{
+    if(!student.id) student.id = makeId('stu_fb_');
+    const idx = db.students.findIndex(s => s.id === student.id || (s.classId === student.classId && s.firebaseUid === uid));
+    if(idx >= 0) db.students[idx] = {...db.students[idx], ...student};
+    else if(!seen.has(student.id)){ db.students.push(student); seen.add(student.id); }
+    ensureLocalMembership(student);
+  });
+  db = zchemNormalizeDB(db);
+  zchemPersistLocalDB();
+}
+
+async function zchemInitAdminRealtimeDatabaseSync(){
+  const ref = zchemDatabase.ref(ZCHEM_APPDATA_PATH);
+  const snap = await ref.once('value');
+  if(snap.exists()){
+    zchemApplyRealtimeDB(snap.val());
+    zchemRealtimeHydrated = true;
+    if(typeof renderAll === 'function') renderAll();
+  }else{
+    zchemRealtimeHydrated = true;
+    if(typeof showToast === 'function') showToast('Realtime Database đang trống. Dữ liệu sẽ được ghi khi admin thực hiện thay đổi.', 'warn');
+  }
+
+  if(!zchemRealtimeMainListenerStarted){
+    zchemRealtimeMainListenerStarted = true;
+    const childKeys = ['dataVersion','realtimeUpdatedAt','settings', ...ZCHEM_ENTITY_COLLECTION_KEYS, ...ZCHEM_META_OBJECT_KEYS];
+    Array.from(new Set(childKeys)).forEach(key=>{
+      zchemRealtimeListen(ZCHEM_APPDATA_PATH + '/' + key, 'value', snapshot=>{
+        const ok = zchemApplyRealtimeNode(key, snapshot.val());
+        if(ok && typeof renderAll === 'function') renderAll();
+      }, error=>{
+        console.error('Không đọc được dữ liệu realtime tại ' + key + ':', error);
+        if(typeof showToast === 'function') showToast('Chưa đọc được dữ liệu Realtime Database. Hãy kiểm tra Rules.', 'warn');
+      });
+    });
+  }
+  zchemStartPresence();
+  zchemInitResultPathListeners(true);
+  return true;
+}
+
+async function zchemInitStudentRealtimeDatabaseSync(){
+  const publicKeys = ['dataVersion','realtimeUpdatedAt','settings','classes','questionBank','monthlyExams','gradeBanks'];
+  for(const key of publicKeys){
+    try{
+      const snap = await zchemDatabase.ref(ZCHEM_APPDATA_PATH + '/' + key).once('value');
+      if(snap.exists()) zchemApplyStudentPublicNode(key, snap.val());
+    }catch(error){ console.warn('Không đọc được public node ' + key + ':', error); }
+  }
+  await zchemLoadStudentMembershipData(zchemAuth.currentUser);
+  zchemRealtimeHydrated = true;
+
+  if(!zchemRealtimeMainListenerStarted){
+    zchemRealtimeMainListenerStarted = true;
+    publicKeys.forEach(key=>{
+      zchemRealtimeListen(ZCHEM_APPDATA_PATH + '/' + key, 'value', snapshot=>{
+        const ok = zchemApplyStudentPublicNode(key, snapshot.val());
+        if(ok && typeof renderAll === 'function') renderAll();
+      }, error=>console.warn('Không đọc được public realtime node ' + key + ':', error));
+    });
+  }
+  zchemStartPresence();
+  zchemInitResultPathListeners(false);
+  if(typeof renderAll === 'function') renderAll();
+  return true;
+}
+
+async function zchemInitRealtimeDatabaseSync(role){
   if(!zchemRealtimeReady || !zchemDatabase || !zchemAuth) return false;
   if(!zchemAuth.currentUser) return false;
   if(zchemRealtimeInitPromise) return zchemRealtimeInitPromise;
 
   zchemRealtimeInitPromise = (async ()=>{
-    const ref = zchemDatabase.ref(ZCHEM_APPDATA_PATH);
     try{
-      const snap = await ref.once('value');
-      if(snap.exists()){
-        zchemApplyRealtimeDB(snap.val());
-        zchemRealtimeHydrated = true;
-        if(typeof renderAll === 'function') renderAll();
-      }else{
-        zchemRealtimeHydrated = true;
-        // ZChemPro1: không tự đẩy DEMO/localStorage lên Firebase khi cloud đang trống.
-        // Admin chỉ ghi lên Firebase sau khi thực hiện thay đổi thật trong giao diện.
-        if(typeof showToast === 'function') showToast('Realtime Database đang trống. Dữ liệu sẽ được ghi khi admin thực hiện thay đổi.', 'warn');
-      }
-
-      if(!zchemRealtimeMainListenerStarted){
-        zchemRealtimeMainListenerStarted = true;
-        zchemRealtimeListen(ZCHEM_APPDATA_PATH, 'value', snapshot=>{
-          if(!snapshot.exists()) return;
-          const incoming = snapshot.val();
-          const incomingJson = JSON.stringify(incoming || {});
-          if(incomingJson === zchemRealtimeLastJson) return;
-          const ok = zchemApplyRealtimeDB(incoming);
-          if(ok && typeof renderAll === 'function') renderAll();
-        }, error=>{
-          console.error('Không đọc được dữ liệu realtime:', error);
-          zchemRealtimeMainListenerStarted = false;
-          if(typeof showToast === 'function') showToast('Chưa đọc được dữ liệu Realtime Database. Hãy kiểm tra Rules.', 'warn');
-        });
-      }
-      zchemStartPresence();
-      zchemInitResultPathListeners();
-      return true;
+      const isAdmin = role === 'admin' || (role !== 'student' && zchemCurrentAuthIsAdmin());
+      if(isAdmin) return await zchemInitAdminRealtimeDatabaseSync();
+      return await zchemInitStudentRealtimeDatabaseSync();
     }catch(error){
       console.error('Không khởi tạo đồng bộ Realtime Database:', error);
       if(typeof showToast === 'function') showToast('Chưa khởi tạo được đồng bộ Realtime Database. Hãy đăng nhập lại hoặc kiểm tra Rules.', 'warn');
@@ -822,17 +1213,36 @@ async function zchemInitRealtimeDatabaseSync(){
 }
 
 
+function zchemSanitizedLocalSnapshot(data){
+  const snapshot = clone(data || {});
+  try{
+    if(snapshot && snapshot.settings && snapshot.settings.currentUser){
+      const localId = snapshot.settings.currentUser;
+      const localUser = Array.isArray(snapshot.users) ? snapshot.users.find(u=>u && u.id===localId) : null;
+      if(localUser && localUser.role === 'admin') snapshot.settings.currentUser = null;
+    }
+  }catch(error){}
+  return snapshot;
+}
+function zchemPersistLocalDB(){
+  localStorage.setItem(STORAGE_KEY, JSON.stringify(zchemSanitizedLocalSnapshot(db)));
+}
 function saveDB(){
   db = zchemNormalizeDB(db);
-  localStorage.setItem(STORAGE_KEY, JSON.stringify(db));
-  const isAdminUser = zchemAuth && zchemAuth.currentUser && (zchemAuth.currentUser.uid === ZCHEM_ADMIN_UID || zchemAuth.currentUser.email === ZCHEM_ADMIN_EMAIL);
+  zchemPersistLocalDB();
+  const isAdminUser = zchemCurrentAuthIsAdmin();
   if(isAdminUser && !zchemRealtimeApplying) zchemScheduleRealtimeSave();
 }
 
   // =========================================================
   // App State
   // =========================================================
-  let db = loadDB();
+  let db = zchemNormalizeDB(loadDB());
+  if(db && db.settings){
+    const startupUser = Array.isArray(db.users) ? db.users.find(u=>u && u.id===db.settings.currentUser) : null;
+    if(startupUser && startupUser.role === 'admin') db.settings.currentUser = null;
+  }
+  try{ zchemPersistLocalDB(); }catch(error){}
   const localAdmin = Array.isArray(db.users) ? db.users.find(u => u.id === 'u-admin') : null;
   if(localAdmin){
     localAdmin.username = 'admin';
@@ -891,7 +1301,36 @@ function saveDB(){
   const nowISO = ()=> new Date().toISOString();
   const formatDate = (v)=> new Date(v).toLocaleString('vi-VN');
   const roleLabel = (r)=> r==='admin'?'Quản trị viên':r==='student'?'Học sinh':'Khách';
-  const currentUser = ()=> db.settings.currentUser ? db.users.find(u=>u.id===db.settings.currentUser) : null;
+  const currentUser = ()=> {
+    const localId = db && db.settings ? db.settings.currentUser : null;
+    const localUser = localId && Array.isArray(db.users) ? db.users.find(u=>u.id===localId) : null;
+    if(localUser) return localUser;
+
+    const firebaseUser = zchemAuth && zchemAuth.currentUser ? zchemAuth.currentUser : null;
+    if(firebaseUser && (zchemAdminSessionActive || zchemAdminLoginInProgress) && zchemCurrentAuthIsAdmin()) return zchemSetAdminSession(firebaseUser);
+
+    const hasAdminSession = zchemAdminSessionActive;
+    if(hasAdminSession){
+      if(!Array.isArray(db.users)) db.users = [];
+      if(!db.settings || typeof db.settings !== 'object') db.settings = {};
+      const adminUser = {
+        id:'u-admin',
+        firebaseUid: zchemAdminSessionUid || (firebaseUser ? firebaseUser.uid : '') || ZCHEM_ADMIN_UID,
+        email: zchemAdminSessionEmail || (firebaseUser ? firebaseUser.email : '') || ZCHEM_ADMIN_EMAIL,
+        username: zchemAdminSessionEmail || (firebaseUser ? firebaseUser.email : '') || ZCHEM_ADMIN_EMAIL || 'admin',
+        password:'',
+        role:'admin',
+        fullName:'Nguyễn Hằng - Admin'
+      };
+      zchemAdminSessionActive = true;
+      zchemAdminSessionUid = adminUser.firebaseUid || '';
+      zchemAdminSessionEmail = adminUser.email || '';
+      upsertLocalUser(adminUser);
+      db.settings.currentUser = 'u-admin';
+      return adminUser;
+    }
+    return null;
+  };
   const averagePercent = (items)=> items.length ? Math.round(items.reduce((s,a)=>s + (a.score/a.total)*100,0)/items.length) : 0;
   const groupBy = (arr, keyFn)=> arr.reduce((acc,item)=>{ const k=keyFn(item); (acc[k]=acc[k]||[]).push(item); return acc; }, {});
   function getAllowedClasses(){
@@ -952,6 +1391,75 @@ function saveDB(){
 
   function emailKey(email=''){
     return normalizeEmail(email).replace(/[.#$\[\]\/]/g, '_');
+  }
+
+
+  function zchemIsConfiguredAdminUser(firebaseUser){
+    if(!firebaseUser) return false;
+    const uid = String(firebaseUser.uid || '').trim();
+    const email = normalizeEmail(firebaseUser.email || '');
+    const adminUid = String(ZCHEM_ADMIN_UID || '').trim();
+    const adminEmail = normalizeEmail(ZCHEM_ADMIN_EMAIL || '');
+    return (!!adminUid && uid === adminUid) || (!!adminEmail && email === adminEmail);
+  }
+
+  function zchemCurrentAuthIsAdmin(){
+    const firebaseUser = zchemAuth && zchemAuth.currentUser ? zchemAuth.currentUser : null;
+    if(!firebaseUser) return false;
+    if(zchemIsConfiguredAdminUser(firebaseUser)) return true;
+    if(zchemAdminSessionActive && zchemAdminSessionUid && zchemAdminSessionUid === firebaseUser.uid) return true;
+    const localId = db && db.settings ? db.settings.currentUser : '';
+    const localUser = Array.isArray(db && db.users ? db.users : []) ? db.users.find(u => u.id === localId) : null;
+    return !!(localUser && localUser.role === 'admin' && (!localUser.firebaseUid || localUser.firebaseUid === firebaseUser.uid));
+  }
+
+  function zchemSetAdminSession(firebaseUser){
+    if(!firebaseUser) return null;
+    zchemAdminSessionActive = true;
+    zchemAdminSessionUid = firebaseUser.uid || '';
+    zchemAdminSessionEmail = firebaseUser.email || ZCHEM_ADMIN_EMAIL || '';
+    const adminUser = {
+      id:'u-admin',
+      firebaseUid: zchemAdminSessionUid,
+      email: zchemAdminSessionEmail,
+      username: zchemAdminSessionEmail,
+      password:'',
+      role:'admin',
+      fullName:'Nguyễn Hằng - Admin'
+    };
+    if(!db.settings || typeof db.settings !== 'object') db.settings = {};
+    if(!Array.isArray(db.users)) db.users = [];
+    upsertLocalUser(adminUser);
+    db.settings.currentUser = 'u-admin';
+    try{ zchemPersistLocalDB(); }catch(error){}
+    return adminUser;
+  }
+
+  async function zchemReadFirebaseUserRole(firebaseUser){
+    if(!firebaseUser || !zchemRealtimeReady || !zchemDatabase) return '';
+    try{
+      const snap = await zchemDatabase.ref('users/' + firebaseUser.uid + '/role').once('value');
+      return String(snap.val() || '').trim();
+    }catch(error){
+      console.warn('Không đọc được role admin từ Firebase:', error);
+      return '';
+    }
+  }
+
+  async function zchemIsAdminFirebaseUser(firebaseUser){
+    if(!firebaseUser) return false;
+    if(zchemIsConfiguredAdminUser(firebaseUser)) return true;
+    const role = await zchemReadFirebaseUserRole(firebaseUser);
+    return role === 'admin';
+  }
+
+  async function zchemWriteAdminProfileSafe(firebaseUser){
+    if(!firebaseUser) return;
+    try{
+      await writeFirebaseUserProfile(firebaseUser, 'admin');
+    }catch(error){
+      console.warn('Không ghi được hồ sơ admin lên Firebase, vẫn giữ quyền admin cục bộ nếu tài khoản hợp lệ:', error);
+    }
   }
 
   function normalizeVietnameseName(name=''){
@@ -1380,17 +1888,17 @@ function saveDB(){
       return;
     }
     try{
-      await zchemAuth.setPersistence(firebase.auth.Auth.Persistence.NONE);
+      await zchemAuth.setPersistence(firebase.auth.Auth.Persistence.LOCAL);
       const provider = new firebase.auth.GoogleAuthProvider();
       const result = await zchemAuth.signInWithPopup(provider);
       const firebaseUser = result.user;
       if(!firebaseUser) throw new Error('Không lấy được thông tin tài khoản Google.');
-      if(firebaseUser.uid === ZCHEM_ADMIN_UID || firebaseUser.email === ZCHEM_ADMIN_EMAIL){
+      if(zchemIsConfiguredAdminUser(firebaseUser)){
         await zchemAuth.signOut();
         showToast('Admin vui lòng đăng nhập bằng khu vực Email/Password.', 'warn');
         return;
       }
-      await zchemInitRealtimeDatabaseSync();
+      await zchemInitRealtimeDatabaseSync('student');
       const {localId, matched} = await createOrUpdateLocalStudentFromFirebase(firebaseUser);
       if(matched && localId){
         db.settings.currentUser = localId;
@@ -1413,20 +1921,23 @@ function saveDB(){
     zchemAuth.onAuthStateChanged(async (firebaseUser)=>{
       if(!firebaseUser) return;
       try{
-        await zchemInitRealtimeDatabaseSync();
-        if(firebaseUser.uid === ZCHEM_ADMIN_UID || firebaseUser.email === ZCHEM_ADMIN_EMAIL){
-          await writeFirebaseUserProfile(firebaseUser, 'admin');
-          upsertLocalUser({
-            id: 'u-admin',
-            firebaseUid: firebaseUser.uid,
-            email: firebaseUser.email || ZCHEM_ADMIN_EMAIL,
-            username: firebaseUser.email || ZCHEM_ADMIN_EMAIL,
-            password: '',
-            role: 'admin',
-            fullName: 'Admin'
-          });
-          db.settings.currentUser = 'u-admin';
+        if(await zchemIsAdminFirebaseUser(firebaseUser)){
+          // Không tự động khôi phục phiên admin sau khi tải lại trang.
+          // Admin phải đăng nhập thủ công bằng Email/Password để mở khu vực quản trị.
+          if(!zchemAdminLoginInProgress && !zchemAdminSessionActive){
+            zchemAdminSessionActive = false;
+            zchemAdminSessionUid = '';
+            zchemAdminSessionEmail = '';
+            if(db && db.settings) db.settings.currentUser = null;
+            saveDB();
+            updateSidebar();
+            renderAll();
+            try{ await zchemAuth.signOut(); }catch(error){}
+            return;
+          }
+          return;
         }else{
+          await zchemInitRealtimeDatabaseSync('student');
           const {localId, matched} = await createOrUpdateLocalStudentFromFirebase(firebaseUser);
           if(!matched || !localId){
             saveDB();
@@ -1567,38 +2078,54 @@ function saveDB(){
       showToast('Vui lòng nhập email và mật khẩu admin.', 'error');
       return;
     }
+
+    let firebaseUser = null;
     try{
+      zchemAdminLoginInProgress = true;
       await zchemAuth.setPersistence(firebase.auth.Auth.Persistence.NONE);
       const credential = await zchemAuth.signInWithEmailAndPassword(email, password);
-      const firebaseUser = credential.user;
-      if(!firebaseUser || firebaseUser.uid !== ZCHEM_ADMIN_UID || firebaseUser.email !== ZCHEM_ADMIN_EMAIL){
+      firebaseUser = credential.user;
+      if(!firebaseUser || !(await zchemIsAdminFirebaseUser(firebaseUser))){
+        zchemAdminLoginInProgress = false;
         await zchemAuth.signOut();
-        showToast('Tài khoản này không phải admin đã khai báo trong hệ thống.', 'error');
+        showToast('Tài khoản này chưa có quyền admin. Hãy kiểm tra email admin hoặc nhánh users/' + (firebaseUser?.uid || '') + '/role trong Firebase.', 'error');
         return;
       }
-      await writeFirebaseUserProfile(firebaseUser, 'admin');
-      upsertLocalUser({
-        id:'u-admin',
-        firebaseUid: firebaseUser.uid,
-        email: firebaseUser.email || ZCHEM_ADMIN_EMAIL,
-        username: firebaseUser.email || ZCHEM_ADMIN_EMAIL,
-        password:'',
-        role:'admin',
-        fullName:'Nguyễn Hằng - Admin'
-      });
-      db.settings.currentUser = 'u-admin';
-      await zchemInitRealtimeDatabaseSync();
+    }catch(error){
+      zchemAdminLoginInProgress = false;
+      console.error('Lỗi xác thực admin:', error);
+      showToast('Đăng nhập admin thất bại: ' + (error.message || error), 'error');
+      return;
+    }
+
+    try{
+      zchemSetAdminSession(firebaseUser);
+      await zchemWriteAdminProfileSafe(firebaseUser);
+      await zchemInitRealtimeDatabaseSync('admin');
+      // Sau khi tải dữ liệu cloud, cần đặt lại session admin vì appData/current có thể không lưu currentUser.
+      zchemSetAdminSession(firebaseUser);
+      db = zchemNormalizeDB(db);
       saveDB();
       updateSidebar();
-      showToast('Đăng nhập admin thành công.', 'success');
       renderAll();
       showScreen('adminScreen');
+      showToast('Đăng nhập admin thành công.', 'success');
+      zchemAdminLoginInProgress = false;
     }catch(error){
-      console.error('Lỗi đăng nhập admin:', error);
-      showToast('Đăng nhập admin thất bại: ' + (error.message || error), 'error');
+      console.error('Đăng nhập thành công nhưng lỗi khi tải giao diện admin:', error);
+      zchemSetAdminSession(firebaseUser);
+      updateSidebar();
+      showScreen('adminScreen');
+      showToast('Đã đăng nhập admin, nhưng có lỗi khi tải giao diện: ' + (error.message || error), 'warn');
+      zchemAdminLoginInProgress = false;
     }
   }
   async function logout(){
+    zchemAdminSessionActive = false;
+    zchemAdminSessionUid = '';
+    zchemAdminSessionEmail = '';
+    zchemAdminLoginInProgress = false;
+    try{ sessionStorage.removeItem(ZCHEM_ADMIN_SESSION_KEY); }catch(error){}
     db.settings.currentUser = null;
     saveDB();
     zchemStopAllRealtimeListeners();
@@ -1935,10 +2462,16 @@ function saveDB(){
   }
 
   function deleteMonthlyExam(examId){
-    if(!confirm('Xóa kỳ thi này?')) return;
+    const exam = (db.monthlyExams || []).find(ex => ex.id === examId);
+    if(!exam){ showToast('Không tìm thấy kỳ thi cần xóa.', 'error'); return; }
+    if(!confirm('Xóa kỳ thi này và toàn bộ kết quả liên quan trên Firebase?')) return;
+    const safeExamId = String(examId);
     db.monthlyExams = (db.monthlyExams || []).filter(ex => ex.id !== examId);
+    db.attempts = (db.attempts || []).filter(a => a.examId !== examId);
+    zchemQueueCloudDelete('monthlyExams', examId);
+    zchemQueueRootPathDelete('results/' + safeExamId);
     saveDB();
-    showToast('Đã xóa kỳ thi.', 'warn');
+    showToast('Đã xóa kỳ thi và kết quả liên quan.', 'warn');
     renderAll();
     showScreen('adminScreen');
   }
@@ -2020,7 +2553,7 @@ function saveDB(){
       if(!classIds.length) return;
 
       const q = {
-        id: uid('q_'),
+        id: makeId('q_'),
         type: item.type || 'single',
         content: item.content,
         points: Number(item.points || 10),
@@ -2283,7 +2816,7 @@ function saveDB(){
   function getQuestions(mode, classId, format){
     return db.questionBank.filter(q=>{
       const modeOk = q.mode==='both' || q.mode===mode;
-      const classOk = q.classIds.includes(classId);
+      const classOk = asArray(q.classIds).includes(classId);
       const formatOk = q.format==='both' || q.format===format;
       return modeOk && classOk && formatOk;
     });
@@ -2443,6 +2976,7 @@ function saveDB(){
   }
 
   function renderQuestionInput(q){
+    q = normalizeQuestionItem(q || {});
     const saved = state.answers[q.id];
     const isLocked = state.quiz?.mode==='exam' && !!state.confirmedAnswers?.[q.id];
     if(q.type==='single'){
@@ -2648,6 +3182,7 @@ function saveDB(){
     renderQuiz();
   }
   function collectResponse(q){
+    q = normalizeQuestionItem(q || {});
     if(q.type==='single' || q.type==='media'){
       return document.querySelector('input[name="singleAnswer"]:checked')?.value || '';
     }
@@ -2678,6 +3213,7 @@ function saveDB(){
     return '';
   }
   function isCorrect(q, response){
+    q = normalizeQuestionItem(q || {});
     if(q.type==='single' || q.type==='media') return response===q.answer;
     if(q.type==='multiple') return [...(response||[])].sort().join('|') === [...(q.answer||[])].sort().join('|');
     if(q.type==='short' || q.type==='fill') return String(response||'').trim().toLowerCase() === String(q.answer||'').trim().toLowerCase();
@@ -3059,7 +3595,7 @@ function saveDB(){
 
       attempts.forEach((a, index) => {
         const classObj = cls(a.classId);
-        const details = a.details || [];
+        const details = asArray(a.details);
         const correct = details.filter(d => d.correct).length;
         const wrong = details.filter(d => !d.correct).length;
         const score10 = a.total ? Math.round((Number(a.score || 0) / Number(a.total || 1)) * 1000) / 100 : 0;
@@ -3238,7 +3774,7 @@ function saveDB(){
                 ${filterStudents.map(stu=>{
                   const userAttempts = filterAttempts.filter(a=>attemptMatchesStudent(a, stu));
                   const progress = computeStudentProgress(stu);
-                  const wrongQs = [...new Set(userAttempts.flatMap(a=>a.details.filter(d=>!d.correct).map(d=>d.q)))].map(qid=> db.questionBank.find(q=>q.id===qid)?.content || qid).slice(0,2);
+                  const wrongQs = [...new Set(userAttempts.flatMap(a=>asArray(a.details).filter(d=>d && !d.correct).map(d=>d.q)))].map(qid=> db.questionBank.find(q=>q.id===qid)?.content || qid).slice(0,2);
                   return `<tr>
                     <td>${esc(stu.name)}</td>
                     <td>${esc(cls(stu.classId)?.name || '')}</td>
@@ -3303,7 +3839,10 @@ function saveDB(){
     return `<div class="lock-screen"><div class="card center"><h3>${esc(message)}</h3><p class="muted">Hãy đăng nhập đúng quyền để tiếp tục.</p><button class="btn" onclick="showScreen('loginScreen')">Đến trang đăng nhập</button></div></div>`;
   }
   function renderAdmin(){
-    const u = currentUser();
+    let u = currentUser();
+    if((!u || u.role !== 'admin') && zchemAdminSessionActive){
+      u = currentUser();
+    }
     if(!u || u.role!=='admin'){ $('adminScreen').innerHTML = locked('Trang này chỉ dành cho admin.'); return; }
 
     $('adminScreen').innerHTML = `
@@ -3374,7 +3913,7 @@ function saveDB(){
                   <tr>
                     <td>${esc(c.name)}</td>
                     <td>${esc(c.grade)}</td>
-                    <td>${c.modes.includes('free') && c.modes.includes('exam') ? 'Cả hai' : c.modes.includes('free') ? 'Tự do' : 'Vào thi'}</td>
+                    <td>${asArray(c.modes).includes('free') && asArray(c.modes).includes('exam') ? 'Cả hai' : asArray(c.modes).includes('free') ? 'Tự do' : 'Vào thi'}</td>
                     <td><button class="btn ghost" style="padding:8px 12px" onclick="viewClassDetail('${c.id}')">Xem</button></td>
                     <td><button class="btn danger" style="padding:8px 12px" onclick="deleteClass('${c.id}')">Xóa</button></td>
                   </tr>
@@ -3563,7 +4102,7 @@ function saveDB(){
                   <tr>
                     <td>${esc(q.content)}</td>
                     <td>${esc(typeLabel(q.type))}</td>
-                    <td>${q.classIds.map(id=>esc(cls(id)?.name || '')).join(', ')}</td>
+                    <td>${asArray(q.classIds).map(id=>esc(cls(id)?.name || '')).filter(Boolean).join(', ')}</td>
                     <td>${q.points}</td>
                     <td><button class="btn ghost" style="padding:8px 12px" onclick="editQuestion('${q.id}')">Sửa</button></td>
                     <td><button class="btn danger" style="padding:8px 12px" onclick="deleteQuestion('${q.id}')">Xóa</button></td>
@@ -3578,6 +4117,7 @@ function saveDB(){
   }
 
   function filteredQuestions(){
+    db.questionBank = asArray(db.questionBank).map(normalizeQuestionItem);
     return db.questionBank.filter(q=>{
       const typeOk = state.questionFilter.type==='all' || q.type===state.questionFilter.type;
       const modeOk = state.questionFilter.mode==='all' || q.mode===state.questionFilter.mode;
@@ -3593,7 +4133,7 @@ function saveDB(){
     const grade = $('classGradeInput').value.trim();
     const mode = $('classModeInput').value;
     if(!name || !grade){ showToast('Vui lòng nhập đủ tên lớp và khối.', 'error'); return; }
-    db.classes.push({id:uid('class_'), name, grade, modes: mode==='both' ? ['free','exam'] : [mode]});
+    db.classes.push({id:makeId('class_'), name, grade, modes: mode==='both' ? ['free','exam'] : [mode]});
     saveDB(); showToast('Đã thêm lớp mới.', 'success'); renderAll();
   }
   function deleteClass(id){
@@ -3603,17 +4143,27 @@ function saveDB(){
     }
     const classObj = cls(id);
     if(!classObj){ showToast('Không tìm thấy lớp cần xóa.', 'error'); return; }
-    const classStudentIds = new Set(db.students.filter(s=>s.classId===id).map(s=>s.id));
-    const classStudentUids = new Set(db.students.filter(s=>s.classId===id && s.firebaseUid).map(s=>s.firebaseUid));
-    const confirmText = `Xóa lớp "${classObj.name}" và ${classStudentIds.size} học sinh thuộc lớp này khỏi dữ liệu ứng dụng?`;
+    const classStudents = db.students.filter(s=>s.classId===id);
+    const classStudentIds = new Set(classStudents.map(s=>s.id));
+    const classStudentUids = new Set(classStudents.filter(s=>s.firebaseUid).map(s=>s.firebaseUid));
+    const allExamIdsBeforeDelete = (db.monthlyExams || []).filter(ex=>ex && ex.id).map(ex=>ex.id);
+    const classExamIdsBeforeDelete = (db.monthlyExams || []).filter(ex=>ex && ex.classId===id && ex.id).map(ex=>ex.id);
+    const confirmText = `Xóa lớp "${classObj.name}" và ${classStudentIds.size} học sinh thuộc lớp này khỏi dữ liệu ứng dụng, bao gồm kết quả liên quan trên Firebase?`;
     if(!confirm(confirmText)) return;
     db.classes = db.classes.filter(c=>c.id!==id);
+    zchemQueueCloudDelete('classes', id);
+    classStudents.forEach(s=>zchemQueueCloudDelete('students', s.id));
     db.students = db.students.filter(s=>s.classId!==id);
     db.attempts = db.attempts.filter(a=>a.classId!==id);
+    classExamIdsBeforeDelete.forEach(examId=>zchemQueueCloudDelete('monthlyExams', examId));
     db.monthlyExams = db.monthlyExams.filter(ex=>ex.classId!==id);
+    // Xóa kết quả thi theo lớp trước khi mất danh sách kỳ thi liên quan.
+    // Với kỳ thi riêng của lớp đã bị xóa, xóa toàn bộ results/{examId}; với kỳ thi theo khối, xóa nhánh results/{examId}/{classId}.
+    classExamIdsBeforeDelete.forEach(examId=>zchemQueueRootPathDelete('results/' + examId));
+    allExamIdsBeforeDelete.forEach(examId=>zchemQueueRootPathDelete('results/' + examId + '/' + id));
     db.questionBank = db.questionBank.map(q=>({
       ...q,
-      classIds: Array.isArray(q.classIds) ? q.classIds.filter(classId=>classId!==id) : q.classIds
+      classIds: asArray(q.classIds).filter(classId=>classId!==id)
     }));
     if(db.classMembers && db.classMembers[id]) delete db.classMembers[id];
     if(db.roster && db.roster[id]) delete db.roster[id];
@@ -3628,9 +4178,8 @@ function saveDB(){
       zchemDatabase.ref('classStudents/' + id).remove().catch(console.error);
       zchemDatabase.ref('classMembers/' + id).remove().catch(console.error);
       classStudentUids.forEach(uid=>zchemDatabase.ref('studentClasses/' + uid + '/' + id).remove().catch(console.error));
-      (db.monthlyExams || []).forEach(ex=>{
-        if(ex && ex.id) zchemDatabase.ref('results/' + ex.id + '/' + id).remove().catch(console.error);
-      });
+      classExamIdsBeforeDelete.forEach(examId=>zchemDatabase.ref('results/' + examId).remove().catch(console.error));
+      allExamIdsBeforeDelete.forEach(examId=>zchemDatabase.ref('results/' + examId + '/' + id).remove().catch(console.error));
     }
     saveDB(); showToast('Đã xóa lớp và dữ liệu học sinh liên quan.', 'warn'); renderAll();
   }
@@ -3674,7 +4223,7 @@ function saveDB(){
     const existedIdentity = findRosterStudentByIdentity(name, birthDate, classId);
     if(existedIdentity){ showToast('Học sinh này đã có trong danh sách lớp.', 'error'); return; }
     if(email && db.students.find(s=>normalizeEmail(s.email)===email)){ showToast('Email này đã có trong danh sách lớp.', 'error'); return; }
-    const student = {id:uid('stu_'), name, birthDate, email, emailKey: emailKey(email), classId, grade:cls(classId)?.grade || '', rosterStatus: email ? 'waiting_email_known' : 'waiting'};
+    const student = {id:makeId('stu_'), name, birthDate, email, emailKey: emailKey(email), classId, grade:cls(classId)?.grade || '', rosterStatus: email ? 'waiting_email_known' : 'waiting'};
     db.students.push(student);
     saveDB();
     try{ await syncRosterStudentToFirebase(student); }catch(error){ console.error(error); showToast('Đã lưu cục bộ, nhưng chưa đồng bộ được danh sách lớp lên Firebase.', 'warn'); }
@@ -3691,8 +4240,14 @@ function saveDB(){
     const confirmed = confirm(`Bạn có chắc muốn xóa học sinh "${student.name}" khỏi danh sách lớp và xóa toàn bộ kết quả liên quan của học sinh này không?`);
     if(!confirmed) return;
 
+    const relatedExamIdsBeforeDelete = (db.monthlyExams || []).filter(ex=>ex && ex.id).map(ex=>ex.id);
     db.attempts = db.attempts.filter(a => !attemptMatchesStudent(a, student));
     db.students = db.students.filter(s => s.id !== studentId);
+    zchemQueueCloudDelete('students', studentId);
+    if(student.firebaseUid){
+      zchemQueueRootPathDelete('freePlayResults/' + student.firebaseUid);
+      relatedExamIdsBeforeDelete.forEach(examId=>zchemQueueRootPathDelete('results/' + examId + '/' + student.classId + '/' + student.firebaseUid));
+    }
 
     if(db.classMembers && student.classId && student.firebaseUid && db.classMembers[student.classId]) delete db.classMembers[student.classId][student.firebaseUid];
     if(db.studentClasses && student.firebaseUid && db.studentClasses[student.firebaseUid]){
@@ -3716,8 +4271,8 @@ function saveDB(){
         zchemDatabase.ref('studentClasses/' + student.firebaseUid + '/' + student.classId).remove().catch(console.error);
         zchemDatabase.ref('freeStudents/' + student.firebaseUid).remove().catch(console.error);
         zchemDatabase.ref('freePlayResults/' + student.firebaseUid).remove().catch(console.error);
-        (db.monthlyExams || []).forEach(ex=>{
-          if(ex && ex.id) zchemDatabase.ref('results/' + ex.id + '/' + student.classId + '/' + student.firebaseUid).remove().catch(console.error);
+        relatedExamIdsBeforeDelete.forEach(examId=>{
+          zchemDatabase.ref('results/' + examId + '/' + student.classId + '/' + student.firebaseUid).remove().catch(console.error);
         });
       }
     }
@@ -3794,11 +4349,11 @@ function saveDB(){
     for(const r of state.importedRows){
       let c = db.classes.find(x=>x.name.toLowerCase()===r.className.toLowerCase());
       if(!c){
-        c = {id:uid('class_'), name:r.className, grade:r.grade || '', modes:['free','exam']};
+        c = {id:makeId('class_'), name:r.className, grade:r.grade || '', modes:['free','exam']};
         db.classes.push(c);
       }
       const existed = findRosterStudentByIdentity(r.name, r.birthDate, c.id) || (r.email ? db.students.find(s=>normalizeEmail(s.email)===normalizeEmail(r.email)) : null);
-      const student = existed || {id:uid('stu_')};
+      const student = existed || {id:makeId('stu_')};
       student.name = r.name;
       student.birthDate = normalizeBirthDate(r.birthDate);
       if(r.email){
@@ -3856,7 +4411,7 @@ function saveDB(){
       if(!classObj) return;
 
       const q = {
-        id: uid('q_'),
+        id: makeId('q_'),
         type: item.type || 'single',
         content: item.content,
         points: Number(item.points || 10),
@@ -3944,7 +4499,7 @@ function saveDB(){
       : [classId];
 
     const q = {
-      id: state.editingQuestionId || uid('q_'),
+      id: state.editingQuestionId || makeId('q_'),
       type, content, points,
       grade: scope === 'grade' ? gradeValue : (cls(classId)?.grade || ''),
       classIds,
@@ -4005,6 +4560,7 @@ function saveDB(){
   function deleteQuestion(id){
     if(!confirm('Xóa câu hỏi này?')) return;
     db.questionBank = db.questionBank.filter(q=>q.id!==id);
+    zchemQueueCloudDelete('questionBank', id);
     saveDB(); renderAll(); showToast('Đã xóa câu hỏi.', 'warn');
   }
   function openQuestionGuide(){
@@ -4293,20 +4849,22 @@ function saveDB(){
   // Init
   // =========================================================
   function renderAll(){
-    updateSidebar();
-    renderHome();
-    renderLogin();
-    renderFreeEntry();
-    renderExamEntry();
-    renderLeaderboards();
-    renderReports();
-    renderAdmin();
-    if(state.quiz) renderQuiz();
+    db = zchemNormalizeDB(db);
+    const safeRender = (name, fn) => {
+      try{ fn(); }catch(error){ console.error('Lỗi render ' + name + ':', error); }
+    };
+    safeRender('sidebar', updateSidebar);
+    safeRender('home', renderHome);
+    safeRender('login', renderLogin);
+    safeRender('freePlay', renderFreeEntry);
+    safeRender('exam', renderExamEntry);
+    safeRender('leaderboards', renderLeaderboards);
+    safeRender('reports', renderReports);
+    safeRender('admin', renderAdmin);
+    if(state.quiz) safeRender('quiz', renderQuiz);
   }
   renderAll();
-  zchemInitRealtimeDatabaseSync();
-  // Không tự động đăng nhập lại sau khi tải trang.
-  if(zchemAuth){ zchemStopAllRealtimeListeners(); zchemAuth.signOut().catch(()=>{}); }
+  restoreFirebaseSession();
   window.addEventListener('beforeunload', ()=>{ zchemStopAllRealtimeListeners(); });
   applyAudioSettings();
   setTimeout(()=>{ applyAudioSettings(); }, 200);
