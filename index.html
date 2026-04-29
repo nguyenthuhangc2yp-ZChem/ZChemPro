@@ -345,7 +345,7 @@
   const ZCHEM_APPDATA_PATH = 'appData/current';
   // Các mảng lớn được lưu trong Firebase theo dạng object keyed-by-id để giảm ghi đè khi nhiều thiết bị/admin cùng thao tác.
   const ZCHEM_ENTITY_COLLECTION_KEYS = ['users','classes','students','questionBank','monthlyExams','gradeBanks','examExitLogs'];
-  const ZCHEM_META_OBJECT_KEYS = ['settings','classMembers','studentClasses','roster'];
+  const ZCHEM_META_OBJECT_KEYS = ['settings','classMembers','studentClasses','roster','studentIdentityIndex'];
   let zchemRealtimeHydrated = false;
   let zchemRealtimeApplying = false;
   let zchemRealtimeWriteTimer = null;
@@ -653,6 +653,7 @@ function loadDB(){
     if(!data.classMembers || typeof data.classMembers !== 'object') data.classMembers = {};
     if(!data.studentClasses || typeof data.studentClasses !== 'object') data.studentClasses = {};
     if(!data.roster || typeof data.roster !== 'object') data.roster = {};
+    if(!data.studentIdentityIndex || typeof data.studentIdentityIndex !== 'object') data.studentIdentityIndex = {};
     if(Array.isArray(data.students)){
       data.students = data.students.map(s=>({birthDate:'', email:'', emailKey:'', rosterStatus:'waiting', ...s}));
     }
@@ -683,6 +684,7 @@ function zchemCreateEmptyDB(){
     classMembers: {},
     studentClasses: {},
     roster: {},
+    studentIdentityIndex: {},
     settings: {...(DEMO.settings || {}), currentUser:null}
   };
 }
@@ -712,7 +714,7 @@ function zchemNormalizeDB(data){
 
   normalized.students = normalized.students
     .filter(st => st && typeof st === 'object')
-    .map(st=>({id:st.id || makeId('stu_'), birthDate:'', email:'', emailKey:'', rosterStatus:'waiting', ...st}));
+    .map(st=>zchemApplyIdentityFields({id:st.id || makeId('stu_'), birthDate:'', email:'', emailKey:'', rosterStatus:'waiting', ...st}));
 
   const validClassIds = new Set(normalized.classes.map(c => c.id));
   const freeId = normalized.classes.find(c => c.id === 'class_free_auto')?.id || 'class_free_auto';
@@ -739,7 +741,7 @@ function zchemNormalizeDB(data){
     .filter(item => item && typeof item === 'object')
     .map(item => ({...item, id:item.id || makeId('gb_')}));
 
-  ['classMembers','studentClasses','roster'].forEach(key=>{
+  ['classMembers','studentClasses','roster','studentIdentityIndex'].forEach(key=>{
     normalized[key] = asPlainObject(normalized[key]);
   });
 
@@ -1255,7 +1257,7 @@ function zchemBuildStudentFromFirebaseProfile(firebaseUser, profile){
   ].filter(Boolean)));
   const primaryClassId = profile.classId || classIds[0] || getFreeClassId();
   const status = profile.rosterStatus || (primaryClassId === getFreeClassId() ? 'free' : 'matched');
-  return {
+  return zchemApplyIdentityFields({
     id: profile.rosterStudentId || (status === 'free' ? 'free_' + firebaseUser.uid : 'profile_' + firebaseUser.uid + '_' + primaryClassId),
     name: profile.displayName || firebaseUser.displayName || 'Học sinh',
     birthDate: normalizeBirthDate(profile.birthDate || ''),
@@ -1265,8 +1267,10 @@ function zchemBuildStudentFromFirebaseProfile(firebaseUser, profile){
     grade: profile.grade || cls(primaryClassId)?.grade || '',
     firebaseUid: firebaseUser.uid,
     rosterStatus: status,
-    linkedAt: profile.linkedAt || nowISO()
-  };
+    linkedAt: profile.linkedAt || nowISO(),
+    identityKey: profile.identityKey || '',
+    fullNameKey: profile.fullNameKey || ''
+  });
 }
 
 async function zchemReadExistingStudentProfile(firebaseUser){
@@ -1429,6 +1433,7 @@ async function zchemInitAdminRealtimeDatabaseSync(){
   zchemStartPresence();
   zchemInitResultPathListeners(true);
   zchemInitAdminStudentProfileListeners();
+  zchemEnsureIdentityIndexForRosterStudents();
   return true;
 }
 
@@ -1796,6 +1801,35 @@ function saveDB(){
     return raw;
   }
 
+  function zchemStudentFullNameKey(fullName=''){
+    return normalizeVietnameseName(fullName);
+  }
+
+  function zchemStudentIdentityKey(fullName='', birthDate=''){
+    const nameKey = zchemStudentFullNameKey(fullName).replace(/\s+/g, '_');
+    const dobKey = normalizeBirthDate(birthDate);
+    if(!nameKey || !dobKey) return '';
+    return zchemFirebasePathKey(nameKey + '_' + dobKey);
+  }
+
+  function zchemApplyIdentityFields(student){
+    if(!student || typeof student !== 'object') return student;
+    const fullName = student.name || student.fullName || student.displayName || '';
+    const birthDate = normalizeBirthDate(student.birthDate || '');
+    student.birthDate = birthDate;
+    student.fullNameKey = student.fullNameKey || zchemStudentFullNameKey(fullName);
+    student.identityKey = student.identityKey || zchemStudentIdentityKey(fullName, birthDate);
+    return student;
+  }
+
+  function zchemSameStudentIdentity(a, b){
+    if(!a || !b) return false;
+    const aKey = a.identityKey || zchemStudentIdentityKey(a.name || a.fullName || '', a.birthDate || '');
+    const bKey = b.identityKey || zchemStudentIdentityKey(b.name || b.fullName || '', b.birthDate || '');
+    return !!aKey && aKey === bKey;
+  }
+
+
   function findRosterStudentByEmail(email){
     const key = normalizeEmail(email);
     if(!key) return null;
@@ -1814,14 +1848,38 @@ function saveDB(){
   }
 
   function findRosterStudentsByIdentity(fullName, birthDate){
+    const identityKey = zchemStudentIdentityKey(fullName, birthDate);
     const nameKey = normalizeVietnameseName(fullName);
     const dobKey = normalizeBirthDate(birthDate);
-    if(!nameKey || !dobKey) return [];
+    if(!identityKey && (!nameKey || !dobKey)) return [];
     return db.students.filter(s =>
       s.rosterStatus !== 'free' &&
-      normalizeVietnameseName(s.name) === nameKey &&
-      normalizeBirthDate(s.birthDate || '') === dobKey
+      ((s.identityKey && s.identityKey === identityKey) ||
+       (normalizeVietnameseName(s.name) === nameKey && normalizeBirthDate(s.birthDate || '') === dobKey))
     );
+  }
+
+  function zchemFindFreeStudentsByIdentityOrAccount(profile={}){
+    const uid = profile.firebaseUid || profile.uid || '';
+    const email = normalizeEmail(profile.email || '');
+    const identityKey = profile.identityKey || zchemStudentIdentityKey(profile.name || profile.fullName || '', profile.birthDate || '');
+    return db.students.filter(s => s && s.rosterStatus === 'free' && (
+      (uid && s.firebaseUid === uid) ||
+      (email && normalizeEmail(s.email || '') === email) ||
+      (identityKey && (s.identityKey === identityKey || zchemStudentIdentityKey(s.name || '', s.birthDate || '') === identityKey))
+    ));
+  }
+
+  function zchemRemoveLocalFreeStudentCopies(profile={}){
+    const matches = zchemFindFreeStudentsByIdentityOrAccount(profile);
+    if(!matches.length) return [];
+    const removeIds = new Set(matches.map(s=>s.id));
+    db.students = db.students.filter(s => !removeIds.has(s.id));
+    const uid = profile.firebaseUid || profile.uid || matches.find(s=>s.firebaseUid)?.firebaseUid || '';
+    const freeClassId = getFreeClassId();
+    if(uid && db.classMembers && db.classMembers[freeClassId]) delete db.classMembers[freeClassId][uid];
+    if(uid && db.studentClasses && db.studentClasses[uid]) delete db.studentClasses[uid][freeClassId];
+    return matches;
   }
 
   function getFreeClassId(){
@@ -1839,13 +1897,30 @@ function saveDB(){
   }
 
   function ensureLocalMembership(student){
-    if(!student || !student.firebaseUid || !student.classId || student.rosterStatus === 'free') return;
+    if(!student || !student.classId || student.rosterStatus === 'free') return;
+    zchemApplyIdentityFields(student);
     if(!db.classMembers || typeof db.classMembers !== 'object') db.classMembers = {};
     if(!db.studentClasses || typeof db.studentClasses !== 'object') db.studentClasses = {};
-    if(!db.classMembers[student.classId]) db.classMembers[student.classId] = {};
-    db.classMembers[student.classId][student.firebaseUid] = true;
-    if(!db.studentClasses[student.firebaseUid]) db.studentClasses[student.firebaseUid] = {};
-    db.studentClasses[student.firebaseUid][student.classId] = true;
+    if(!db.studentIdentityIndex || typeof db.studentIdentityIndex !== 'object') db.studentIdentityIndex = {};
+    if(student.firebaseUid){
+      if(!db.classMembers[student.classId]) db.classMembers[student.classId] = {};
+      db.classMembers[student.classId][student.firebaseUid] = true;
+      if(!db.studentClasses[student.firebaseUid]) db.studentClasses[student.firebaseUid] = {};
+      db.studentClasses[student.firebaseUid][student.classId] = true;
+    }
+    if(student.identityKey){
+      if(!db.studentIdentityIndex[student.identityKey]) db.studentIdentityIndex[student.identityKey] = {};
+      if(!db.studentIdentityIndex[student.identityKey][student.classId]) db.studentIdentityIndex[student.identityKey][student.classId] = {};
+      db.studentIdentityIndex[student.identityKey][student.classId][student.id] = {
+        classId: student.classId,
+        studentId: student.id,
+        fullName: student.name || '',
+        fullNameKey: student.fullNameKey || zchemStudentFullNameKey(student.name || ''),
+        birthDate: normalizeBirthDate(student.birthDate || ''),
+        grade: student.grade || cls(student.classId)?.grade || '',
+        rosterStatus: student.rosterStatus || 'waiting'
+      };
+    }
   }
 
   function getStudentRosterMatches(firebaseUid){
@@ -1940,13 +2015,117 @@ function saveDB(){
     }
   }
 
+  async function zchemReadIdentityMatchesFromFirebase(fullName, birthDate){
+    if(!zchemRealtimeReady || !zchemDatabase) return [];
+    const identityKey = zchemStudentIdentityKey(fullName, birthDate);
+    if(!identityKey) return [];
+    try{
+      const snap = await zchemDatabase.ref('studentIdentityIndex/' + identityKey).once('value');
+      const root = snap.val() || {};
+      const matches = [];
+      Object.entries(root || {}).forEach(([classId, classNode])=>{
+        Object.values(classNode || {}).forEach(item=>{
+          if(item && typeof item === 'object'){
+            matches.push(zchemApplyIdentityFields({
+              id: item.studentId || item.id || makeId('stu_idx_'),
+              name: item.fullName || fullName,
+              birthDate: normalizeBirthDate(item.birthDate || birthDate),
+              email: '',
+              emailKey: '',
+              classId: item.classId || classId,
+              grade: item.grade || cls(item.classId || classId)?.grade || '',
+              rosterStatus: item.rosterStatus || 'waiting',
+              identityKey,
+              fullNameKey: item.fullNameKey || zchemStudentFullNameKey(fullName)
+            }));
+          }
+        });
+      });
+      return matches;
+    }catch(error){
+      console.warn('Không đọc được studentIdentityIndex:', error);
+      return [];
+    }
+  }
+
+  async function zchemFindStudentMatchesByIdentity(fullName, birthDate){
+    const localMatches = findRosterStudentsByIdentity(fullName, birthDate);
+    const cloudMatches = await zchemReadIdentityMatchesFromFirebase(fullName, birthDate);
+    const byKey = new Map();
+    [...localMatches, ...cloudMatches].forEach(item=>{
+      if(!item || !item.classId) return;
+      zchemApplyIdentityFields(item);
+      const key = item.classId + '@@' + item.id;
+      if(!byKey.has(key)) byKey.set(key, item);
+      else byKey.set(key, {...byKey.get(key), ...item});
+    });
+    return Array.from(byKey.values());
+  }
+
+  async function zchemRemoveFreeStudentCloudCopies(student){
+    if(!student || !zchemRealtimeReady || !zchemDatabase) return;
+    const uid = student.firebaseUid || '';
+    const emailK = emailKey(student.email || '');
+    const identityKey = student.identityKey || zchemStudentIdentityKey(student.name || student.fullName || '', student.birthDate || '');
+    const freeClassId = getFreeClassId();
+    const updates = {};
+    [emailK, uid, student.id, identityKey].filter(Boolean).forEach(key=>{ updates['freeStudents/' + zchemFirebasePathKey(key)] = null; });
+    if(uid){
+      updates['classMembers/' + freeClassId + '/' + uid] = null;
+      updates['studentClasses/' + uid + '/' + freeClassId] = null;
+      updates['leaderboards/free/' + freeClassId + '/' + uid] = null;
+    }
+    [student.id, identityKey, uid, emailK].filter(Boolean).forEach(key=>{
+      updates['classStudents/' + freeClassId + '/' + zchemFirebasePathKey(key)] = null;
+      updates['roster/' + freeClassId + '/' + zchemFirebasePathKey(key)] = null;
+    });
+    if(Object.keys(updates).length){
+      try{ await zchemDatabase.ref().update(updates); }
+      catch(error){ console.warn('Không xóa được dữ liệu lớp tự do trên Firebase:', error); }
+    }
+  }
+
+  async function zchemRemoveFreeStudentAfterOfficialMatch(student){
+    if(!student) return;
+    zchemApplyIdentityFields(student);
+    zchemRemoveLocalFreeStudentCopies(student);
+    await zchemRemoveFreeStudentCloudCopies(student);
+  }
+
+  async function zchemEnsureIdentityIndexForRosterStudents(){
+    if(!zchemCurrentAuthIsAdmin() || !zchemRealtimeReady || !zchemDatabase) return;
+    const updates = {};
+    (db.students || []).forEach(raw=>{
+      const student = zchemApplyIdentityFields({...raw});
+      if(!student || student.rosterStatus === 'free' || !student.classId || !student.id || !student.identityKey) return;
+      const payload = {
+        classId: student.classId,
+        studentId: student.id,
+        fullName: student.name || '',
+        fullNameKey: student.fullNameKey || zchemStudentFullNameKey(student.name || ''),
+        birthDate: normalizeBirthDate(student.birthDate || ''),
+        grade: student.grade || cls(student.classId)?.grade || '',
+        rosterStatus: student.rosterStatus || 'waiting'
+      };
+      updates['studentIdentityIndex/' + student.identityKey + '/' + student.classId + '/' + student.id] = payload;
+    });
+    if(Object.keys(updates).length){
+      try{ await zchemDatabase.ref().update(updates); }
+      catch(error){ console.warn('Không cập nhật được studentIdentityIndex:', error); }
+    }
+  }
+
   async function syncRosterStudentToFirebase(student){
     if(!student || !zchemRealtimeReady || !zchemDatabase) return;
+    zchemApplyIdentityFields(student);
     const key = emailKey(student.email || '');
+    const identityKey = student.identityKey || zchemStudentIdentityKey(student.name || '', student.birthDate || '');
     const classObj = cls(student.classId);
     const payload = {
       studentId: student.id,
       fullName: student.name || '',
+      fullNameKey: student.fullNameKey || zchemStudentFullNameKey(student.name || ''),
+      identityKey,
       birthDate: normalizeBirthDate(student.birthDate || ''),
       email: normalizeEmail(student.email || ''),
       emailKey: key,
@@ -1959,35 +2138,58 @@ function saveDB(){
       updatedAt: firebase.database.ServerValue.TIMESTAMP
     };
     if(student.rosterStatus === 'free'){
-      const freeKey = key || student.firebaseUid || student.id;
+      const freeKey = identityKey || key || student.firebaseUid || student.id;
       if(!freeKey) return;
-      await zchemDatabase.ref('freeStudents/' + freeKey).update(payload);
+      const updates = {};
+      updates['freeStudents/' + zchemFirebasePathKey(freeKey)] = payload;
+      if(key) updates['freeStudents/' + zchemFirebasePathKey(key)] = payload;
+      if(student.firebaseUid) updates['freeStudents/' + zchemFirebasePathKey(student.firebaseUid)] = payload;
       if(student.firebaseUid){
-        await zchemDatabase.ref('classMembers/' + getFreeClassId() + '/' + student.firebaseUid).set(true);
-        await zchemDatabase.ref('studentClasses/' + student.firebaseUid + '/' + getFreeClassId()).set(true);
+        updates['classMembers/' + getFreeClassId() + '/' + student.firebaseUid] = true;
+        updates['studentClasses/' + student.firebaseUid + '/' + getFreeClassId()] = true;
       }
+      await zchemDatabase.ref().update(updates);
       return;
     }
-    await zchemDatabase.ref('roster/' + student.classId + '/' + student.id).update(payload);
-    await zchemDatabase.ref('classStudents/' + student.classId + '/' + student.id).update(payload);
+    const updates = {};
+    updates['roster/' + student.classId + '/' + student.id] = payload;
+    updates['classStudents/' + student.classId + '/' + student.id] = payload;
     if(student.firebaseUid){
       ensureLocalMembership(student);
-      await zchemDatabase.ref('classMembers/' + student.classId + '/' + student.firebaseUid).set(true);
-      await zchemDatabase.ref('studentClasses/' + student.firebaseUid + '/' + student.classId).set(true);
+      updates['classMembers/' + student.classId + '/' + student.firebaseUid] = true;
+      updates['studentClasses/' + student.firebaseUid + '/' + student.classId] = true;
+      updates['studentClasses/' + student.firebaseUid + '/' + getFreeClassId()] = null;
+      updates['classMembers/' + getFreeClassId() + '/' + student.firebaseUid] = null;
     }
-    if(key){
-      await zchemDatabase.ref('studentClassIndex/' + key + '/' + student.classId).update({
+    if(identityKey){
+      updates['studentIdentityIndex/' + identityKey + '/' + student.classId + '/' + student.id] = {
         classId: student.classId || '',
         studentId: student.id,
         fullName: student.name || '',
+        fullNameKey: student.fullNameKey || zchemStudentFullNameKey(student.name || ''),
+        birthDate: normalizeBirthDate(student.birthDate || ''),
+        grade: payload.grade,
+        rosterStatus: student.rosterStatus || 'matched',
+        updatedAt: firebase.database.ServerValue.TIMESTAMP
+      };
+    }
+    if(key){
+      updates['studentClassIndex/' + key + '/' + student.classId] = {
+        classId: student.classId || '',
+        studentId: student.id,
+        fullName: student.name || '',
+        fullNameKey: student.fullNameKey || zchemStudentFullNameKey(student.name || ''),
+        identityKey,
         birthDate: normalizeBirthDate(student.birthDate || ''),
         email: normalizeEmail(student.email || ''),
         grade: payload.grade,
         firebaseUid: student.firebaseUid || '',
         rosterStatus: student.rosterStatus || 'matched',
         updatedAt: firebase.database.ServerValue.TIMESTAMP
-      });
+      };
     }
+    await zchemDatabase.ref().update(updates);
+    await zchemRemoveFreeStudentAfterOfficialMatch(student);
   }
 
   async function createLocalStudentUser(firebaseUser, student, rosterStatus, matches=[]){
@@ -2008,6 +2210,9 @@ function saveDB(){
       classIds,
       grade: student?.grade || primaryClass?.grade || '',
       rosterStudentId: student?.id || '',
+      birthDate: normalizeBirthDate(student?.birthDate || ''),
+      identityKey: student?.identityKey || zchemStudentIdentityKey(student?.name || firebaseUser.displayName || '', student?.birthDate || ''),
+      fullNameKey: student?.fullNameKey || zchemStudentFullNameKey(student?.name || firebaseUser.displayName || ''),
       rosterStatus: rosterStatus || student?.rosterStatus || 'not_registered'
     };
     upsertLocalUser(localUserData);
@@ -2024,6 +2229,7 @@ function saveDB(){
       matched.emailKey = emailKey(matched.email);
       matched.linkedAt = matched.linkedAt || nowISO();
       if(matched.rosterStatus !== 'free') matched.rosterStatus = 'matched';
+      zchemApplyIdentityFields(matched);
       ensureLocalMembership(matched);
     });
     const primary = matches[0];
@@ -2042,6 +2248,7 @@ function saveDB(){
     for(const matched of matches){
       await syncRosterStudentToFirebase(matched);
     }
+    await zchemRemoveFreeStudentAfterOfficialMatch(primary);
     const localId = await createLocalStudentUser(firebaseUser, primary, 'matched', matches);
     return {localId, matched:primary, matches};
   }
@@ -2101,7 +2308,7 @@ function saveDB(){
     const birthDate = normalizeBirthDate($('regStudentBirthDate').value);
     if(!fullName || !birthDate){ showToast('Vui lòng nhập đủ họ tên và ngày sinh.', 'error'); return; }
 
-    const matches = findRosterStudentsByIdentity(fullName, birthDate);
+    const matches = await zchemFindStudentMatchesByIdentity(fullName, birthDate);
     let student;
     let localId;
     let message;
@@ -2113,6 +2320,7 @@ function saveDB(){
         matched.birthDate = birthDate;
         matched.linkedAt = nowISO();
         matched.rosterStatus = 'matched';
+        zchemApplyIdentityFields(matched);
         ensureLocalMembership(matched);
       });
       student = matches[0];
@@ -2131,6 +2339,7 @@ function saveDB(){
       for(const matched of matches){
         try{ await syncRosterStudentToFirebase(matched); }catch(error){ console.error(error); }
       }
+      await zchemRemoveFreeStudentAfterOfficialMatch(student);
       localId = await createLocalStudentUser(firebaseUser, student, 'matched', matches);
       message = 'Đăng kí thành công. Hệ thống đã ghép em với: ' + classNames + '.';
     }else{
@@ -2146,6 +2355,7 @@ function saveDB(){
       student.grade = 'Tự do';
       student.rosterStatus = 'free';
       student.linkedAt = nowISO();
+      zchemApplyIdentityFields(student);
       if(!existedFree) db.students.push(student);
       await writeFirebaseUserProfile(firebaseUser, 'student', {
         displayName: student.name,
@@ -4671,8 +4881,9 @@ function saveDB(){
     if(!birthDate){ showToast('Vui lòng nhập ngày sinh học sinh.', 'error'); return; }
     const existedIdentity = findRosterStudentByIdentity(name, birthDate, classId);
     if(existedIdentity){ showToast('Học sinh này đã có trong danh sách lớp.', 'error'); return; }
-    if(email && db.students.find(s=>normalizeEmail(s.email)===email)){ showToast('Email này đã có trong danh sách lớp.', 'error'); return; }
-    const student = {id:makeId('stu_'), name, birthDate, email, emailKey: emailKey(email), classId, grade:cls(classId)?.grade || '', rosterStatus: email ? 'waiting_email_known' : 'waiting'};
+    const sameIdentityAnyClass = findRosterStudentsByIdentity(name, birthDate).find(s=>s.firebaseUid || s.email);
+    const finalEmail = email || normalizeEmail(sameIdentityAnyClass?.email || '');
+    const student = zchemApplyIdentityFields({id:makeId('stu_'), name, birthDate, email: finalEmail, emailKey: emailKey(finalEmail), firebaseUid: sameIdentityAnyClass?.firebaseUid || '', classId, grade:cls(classId)?.grade || '', rosterStatus: sameIdentityAnyClass?.firebaseUid ? 'matched' : (finalEmail ? 'waiting_email_known' : 'waiting')});
     db.students.push(student);
     saveDB();
     try{ await syncRosterStudentToFirebase(student); }catch(error){ console.error(error); showToast('Đã lưu cục bộ, nhưng chưa đồng bộ được danh sách lớp lên Firebase.', 'warn'); }
@@ -4714,6 +4925,8 @@ function saveDB(){
       if(student.id){
         zchemDatabase.ref('roster/' + student.classId + '/' + student.id).remove().catch(console.error);
         zchemDatabase.ref('classStudents/' + student.classId + '/' + student.id).remove().catch(console.error);
+        const identityKey = student.identityKey || zchemStudentIdentityKey(student.name || '', student.birthDate || '');
+        if(identityKey) zchemDatabase.ref('studentIdentityIndex/' + identityKey + '/' + student.classId + '/' + student.id).remove().catch(console.error);
       }
       if(student.firebaseUid){
         zchemDatabase.ref('classMembers/' + student.classId + '/' + student.firebaseUid).remove().catch(console.error);
@@ -4801,7 +5014,7 @@ function saveDB(){
         c = {id:makeId('class_'), name:r.className, grade:r.grade || '', modes:['free','exam']};
         db.classes.push(c);
       }
-      const existed = findRosterStudentByIdentity(r.name, r.birthDate, c.id) || (r.email ? db.students.find(s=>normalizeEmail(s.email)===normalizeEmail(r.email)) : null);
+      const existed = findRosterStudentByIdentity(r.name, r.birthDate, c.id);
       const student = existed || {id:makeId('stu_')};
       student.name = r.name;
       student.birthDate = normalizeBirthDate(r.birthDate);
@@ -4815,6 +5028,7 @@ function saveDB(){
       student.classId = c.id;
       student.grade = c.grade || r.grade || '';
       student.rosterStatus = student.firebaseUid ? 'matched' : 'waiting';
+      zchemApplyIdentityFields(student);
       if(!existed){ db.students.push(student); added++; }
       try{ await syncRosterStudentToFirebase(student); }catch(error){ console.error('Không đồng bộ được học sinh lên Firebase:', error); }
     }
